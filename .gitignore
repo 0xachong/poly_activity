@@ -1,0 +1,13 @@
+# Rust
+/target/
+
+# Local data (optional: remove if you want to track data/)
+/data/*.duckdb
+/data/*.db
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
