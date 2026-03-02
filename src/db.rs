@@ -227,3 +227,43 @@ pub fn register_wallet(path: &str, address: &str) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// 缓存概况：地址数、全库 ts 起止、活动条数
+#[derive(Debug, Default)]
+pub struct CacheSummary {
+    pub address_count: u64,
+    pub min_ts: Option<i64>,
+    pub max_ts: Option<i64>,
+    pub record_count: u64,
+}
+
+/// 获取缓存钱包数据概况
+pub fn get_cache_summary(path: &str) -> Result<CacheSummary> {
+    let conn = open(path)?;
+    let address_count: u64 = conn.query_row(
+        "SELECT COUNT(DISTINCT address) FROM activities",
+        [],
+        |r| r.get(0),
+    )?;
+    let record_count: u64 = conn.query_row("SELECT COUNT(*) FROM activities", [], |r| r.get(0))?;
+    let min_ts: Option<i64> = conn.query_row("SELECT min(ts) FROM activities", [], |r| r.get(0))?;
+    let max_ts: Option<i64> = conn.query_row("SELECT max(ts) FROM activities", [], |r| r.get(0))?;
+    Ok(CacheSummary {
+        address_count,
+        min_ts,
+        max_ts,
+        record_count,
+    })
+}
+
+/// 每个地址缓存的条数，按条数降序
+pub fn list_address_record_counts(path: &str) -> Result<Vec<(String, u64)>> {
+    let conn = open(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT address, COUNT(*) AS cnt FROM activities GROUP BY address ORDER BY cnt DESC",
+    )?;
+    let list = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(list)
+}
