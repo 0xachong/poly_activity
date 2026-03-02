@@ -28,8 +28,15 @@ if [ -f "$PID_FILE" ]; then
   fi
   rm -f "$PID_FILE"
 fi
-# 兜底：按完整路径结束残留进程（macOS/Ubuntu 均支持 pkill -f）
+# 兜底1：按完整路径匹配命令行（对 ./poly_activity 可能不匹配）
 pkill -f "$ROOT/$BIN_NAME" 2>/dev/null || true
+# 兜底2：用 lsof 找正在执行该二进制文件的进程并结束（无论用何种方式启动）
+if [ -f "$ROOT/$BIN_NAME" ]; then
+  for pid in $(lsof -t "$ROOT/$BIN_NAME" 2>/dev/null); do
+    kill -9 "$pid" 2>/dev/null || true
+    echo "  已停止进程 $pid (lsof)"
+  done
+fi
 sleep 1
 
 echo "[3/4] 拷贝到项目根目录..."
