@@ -31,7 +31,7 @@ impl Config {
             http_port: env::var("HTTP_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(8080),
+                .unwrap_or(7001),
             request_timeout_secs: env::var("REQUEST_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
