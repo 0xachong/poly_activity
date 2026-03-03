@@ -12,7 +12,15 @@
 
 ---
 
-## 2. 获取指定时间区间内每日交易额与利润（聚合数据）
+## 2. 获取某钱包当前未平仓 token 列表
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/wallets/:address/open-positions` | 该钱包当前未平仓 token。Path：`address`（0x 地址）。返回 `address`、`total`、`data`：[{ `token_id`, `condition_id`, `share` }]。数据在每次同步后按活动顺序重算维护。 |
+
+---
+
+## 3. 获取指定时间区间内每日交易额与利润（聚合数据）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -24,6 +32,7 @@
 ## 小结
 
 - **历史交易**：`GET /wallets/:address/activity`，可选 `force_refresh` 清空重拉。
+- **未平仓**：`GET /wallets/:address/open-positions`，返回当前未平仓 token 列表。
 - **每日统计**：`GET /daily-stats?wallet=0x...&from_date=...&to_date=...`，得到每日 volume（仅 BUY）与 profit（仅卖出赚亏）。
 
 前端页面已移至 `frontend/` 目录（dashboard、account-detail、account-manage）。

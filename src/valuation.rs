@@ -42,8 +42,9 @@ fn sell_redeem_cash_with_share(row: &ActivityRow, effective_share: Option<f64>) 
     s * p
 }
 
-/// 按顺序计算每条 REDEEM 的有效 share（该 token 当前持仓）
-fn effective_redeem_shares(activities: &[ActivityRow]) -> Vec<Option<f64>> {
+/// 按顺序计算每条 REDEEM 的有效 share（该 token 兑付前持仓，兑付后归零）。
+/// 供 API/导出展示用：REDEEM 应展示此值而非 API 返回的 share。
+pub fn effective_redeem_shares(activities: &[ActivityRow]) -> Vec<Option<f64>> {
     let mut out = vec![None; activities.len()];
     let mut token_to_share: HashMap<String, f64> = HashMap::new();
     let mut token_to_condition: HashMap<String, String> = HashMap::new();
@@ -80,6 +81,56 @@ fn effective_redeem_shares(activities: &[ActivityRow]) -> Vec<Option<f64>> {
         }
     }
     out
+}
+
+/// 一次遍历得到：每条 REDEEM 的有效 share + 当前未平仓 (token_id, condition_id, share)。
+/// 供同步后落库：effective_share 写入 activities，未平仓写入 open_positions。
+pub fn effective_redeem_shares_and_open_positions(
+    activities: &[ActivityRow],
+) -> (Vec<Option<f64>>, Vec<(String, String, f64)>) {
+    let effective = effective_redeem_shares(activities);
+    let mut token_to_share: HashMap<String, f64> = HashMap::new();
+    let mut token_to_condition: HashMap<String, String> = HashMap::new();
+    for r in activities.iter() {
+        let type_upper = r.type_.to_uppercase();
+        let t = type_upper.as_str();
+        if t != "BUY" && t != "SELL" && t != "REDEEM" && t != "CLAIM" {
+            continue;
+        }
+        let cond = r.condition_id.as_deref().unwrap_or("");
+        let mut tok = r.token_id.as_deref().unwrap_or("").to_string();
+        if tok.is_empty() && !cond.is_empty() && (t == "SELL" || t == "REDEEM" || t == "CLAIM") {
+            tok = positions::resolve_token_for_reduce(
+                cond,
+                r.share.unwrap_or(0.0),
+                &token_to_share,
+                &token_to_condition,
+            );
+        }
+        if tok.is_empty() {
+            continue;
+        }
+        let share = r.share.unwrap_or(0.0);
+        if t == "REDEEM" {
+            let pos = token_to_share.get(&tok).copied().unwrap_or(0.0).max(0.0);
+            token_to_share.entry(tok.clone()).and_modify(|s| *s -= pos);
+        } else {
+            let sign = if t == "BUY" { 1.0 } else { -1.0 };
+            *token_to_share.entry(tok.clone()).or_insert(0.0) += sign * share;
+        }
+        if !cond.is_empty() {
+            token_to_condition.entry(tok).or_insert_with(|| cond.to_string());
+        }
+    }
+    let open_positions: Vec<(String, String, f64)> = token_to_share
+        .into_iter()
+        .filter(|(_, s)| *s > 1e-9)
+        .map(|(tok, s)| {
+            let cond = token_to_condition.get(&tok).cloned().unwrap_or_default();
+            (tok, cond, s)
+        })
+        .collect();
+    (effective, open_positions)
 }
 
 /// 单条活动对「交易额」的贡献：仅 BUY 的买入金额

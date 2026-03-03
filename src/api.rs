@@ -8,6 +8,7 @@ use axum::{
 };
 use axum::body::Body;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -37,6 +38,44 @@ pub struct ActivityQuery {
 
 fn default_limit() -> u32 {
     50_000
+}
+
+/// REDEEM 展示用：按历史持仓算出的有效份额。key = (ts, tx_hash, condition_id, token_id)
+/// 性能：会拉取该地址 [min_ts, to_ts] 的全量活动（一次 list_activities_in_range），仅当本页含 REDEEM 时才调用。
+fn effective_redeem_share_map(
+    path: &str,
+    address: &str,
+    to_ts: i64,
+) -> HashMap<(i64, Option<String>, Option<String>, Option<String>), f64> {
+    let (min_ts, _) = match db::get_ts_range(path, address) {
+        Ok(Some(range)) => range,
+        _ => return HashMap::new(),
+    };
+    let activities = match db::list_activities_in_range(path, address, min_ts, to_ts, 5_000_000) {
+        Ok(a) => a,
+        Err(_) => return HashMap::new(),
+    };
+    let effective = valuation::effective_redeem_shares(&activities);
+    let mut map = HashMap::new();
+    for (i, row) in activities.iter().enumerate() {
+        if row.type_.eq_ignore_ascii_case("REDEEM") {
+            if let Some(s) = effective.get(i).copied().flatten() {
+                let key = (
+                    row.ts,
+                    row.transaction_hash.clone(),
+                    row.condition_id.clone(),
+                    row.token_id.clone(),
+                );
+                map.insert(key, s);
+            }
+        }
+    }
+    map
+}
+
+/// 本页是否包含至少一条 REDEEM（用于决定是否拉全量算 effective_redeem，避免无 REDEEM 时的额外查询）
+fn page_has_redeem(rows: &[db::ActivityRow]) -> bool {
+    rows.iter().any(|r| r.type_.eq_ignore_ascii_case("REDEEM"))
 }
 
 #[derive(Serialize)]
@@ -102,6 +141,61 @@ pub struct BatchActivityResponse {
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct OpenPositionItem {
+    pub token_id: String,
+    pub condition_id: String,
+    pub share: f64,
+}
+
+#[derive(Serialize)]
+pub struct OpenPositionsResponse {
+    pub address: String,
+    pub total: u64,
+    pub data: Vec<OpenPositionItem>,
+}
+
+/// GET /wallets/:address/open-positions — 该钱包当前未平仓 token 列表（同步时维护）
+async fn get_open_positions(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> Result<Json<OpenPositionsResponse>, (StatusCode, Json<ErrorBody>)> {
+    let addr = address.trim().to_lowercase();
+    if addr.is_empty() || !addr.starts_with("0x") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                code: "BAD_REQUEST".into(),
+                message: "invalid address".into(),
+            }),
+        ));
+    }
+    let path = &state.config.duckdb_path;
+    let rows = db::list_open_positions(path, &addr).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                code: "DB_ERROR".into(),
+                message: e.to_string(),
+            }),
+        )
+    })?;
+    let data: Vec<OpenPositionItem> = rows
+        .into_iter()
+        .map(|r| OpenPositionItem {
+            token_id: r.token_id,
+            condition_id: r.condition_id,
+            share: r.share,
+        })
+        .collect();
+    let total = data.len() as u64;
+    Ok(Json(OpenPositionsResponse {
+        address: addr,
+        total,
+        data,
+    }))
 }
 
 /// GET /wallets/:address/activity — 某钱包某段时间历史交易；force_refresh=true 时清空后从 Polymarket 重拉
@@ -201,18 +295,44 @@ async fn get_wallet_activity(
         )
     })?;
 
+    // 仅当本页有 REDEEM 且存在 effective_share 未落库的旧数据时才拉全量重算
+    let need_redeem_fallback =
+        page_has_redeem(&rows) && rows.iter().any(|r| r.type_.eq_ignore_ascii_case("REDEEM") && r.effective_share.is_none());
+    let effective_redeem = if need_redeem_fallback {
+        let eff_ts = rows.iter().map(|r| r.ts).max().unwrap_or(to_ts);
+        effective_redeem_share_map(path, &addr, eff_ts)
+    } else {
+        HashMap::new()
+    };
+
     let d: Vec<ActivityItemCompact> = rows
         .into_iter()
-        .map(|r| ActivityItemCompact {
-            ts: r.ts,
-            type_: r.type_,
-            share: r.share,
-            price: r.price,
-            title: r.title,
-            outcome: r.outcome,
-            condition_id: r.condition_id,
-            token_id: r.token_id,
-            transaction_hash: r.transaction_hash,
+        .map(|r| {
+            let share = if r.type_.eq_ignore_ascii_case("REDEEM") {
+                r.effective_share
+                    .or_else(|| {
+                        effective_redeem.get(&(
+                            r.ts,
+                            r.transaction_hash.clone(),
+                            r.condition_id.clone(),
+                            r.token_id.clone(),
+                        )).copied()
+                    })
+                    .or(r.share)
+            } else {
+                r.share
+            };
+            ActivityItemCompact {
+                ts: r.ts,
+                type_: r.type_,
+                share,
+                price: r.price,
+                title: r.title,
+                outcome: r.outcome,
+                condition_id: r.condition_id,
+                token_id: r.token_id,
+                transaction_hash: r.transaction_hash,
+            }
         })
         .collect();
 
@@ -281,18 +401,42 @@ async fn post_wallets_activity(
             None,
         )
         .unwrap_or((vec![], 0));
+        let need_redeem_fallback =
+            page_has_redeem(&rows) && rows.iter().any(|r| r.type_.eq_ignore_ascii_case("REDEEM") && r.effective_share.is_none());
+        let effective_redeem = if need_redeem_fallback {
+            let eff_ts = rows.iter().map(|r| r.ts).max().unwrap_or(to_ts);
+            effective_redeem_share_map(path, &addr, eff_ts)
+        } else {
+            HashMap::new()
+        };
         let d: Vec<ActivityItemCompact> = rows
             .into_iter()
-            .map(|r| ActivityItemCompact {
-                ts: r.ts,
-                type_: r.type_,
-                share: r.share,
-                price: r.price,
-                title: r.title,
-                outcome: r.outcome,
-                condition_id: r.condition_id,
-                token_id: r.token_id,
-                transaction_hash: r.transaction_hash,
+            .map(|r| {
+                let share = if r.type_.eq_ignore_ascii_case("REDEEM") {
+                    r.effective_share
+                        .or_else(|| {
+                            effective_redeem.get(&(
+                                r.ts,
+                                r.transaction_hash.clone(),
+                                r.condition_id.clone(),
+                                r.token_id.clone(),
+                            )).copied()
+                        })
+                        .or(r.share)
+                } else {
+                    r.share
+                };
+                ActivityItemCompact {
+                    ts: r.ts,
+                    type_: r.type_,
+                    share,
+                    price: r.price,
+                    title: r.title,
+                    outcome: r.outcome,
+                    condition_id: r.condition_id,
+                    token_id: r.token_id,
+                    transaction_hash: r.transaction_hash,
+                }
             })
             .collect();
         let from_time = d.iter().map(|x| x.ts).min().and_then(|ts| {
@@ -496,6 +640,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/wallets/:address/activity",
             axum::routing::get(get_wallet_activity),
+        )
+        .route(
+            "/wallets/:address/open-positions",
+            axum::routing::get(get_open_positions),
         )
         .route("/daily-stats", axum::routing::get(get_daily_stats).post(post_daily_stats))
         .with_state(state)

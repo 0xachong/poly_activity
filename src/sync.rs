@@ -4,6 +4,7 @@
 use crate::config::Config;
 use crate::db::{self, ActivityRow};
 use crate::rate_limit::RateLimiter;
+use crate::valuation;
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
@@ -140,6 +141,7 @@ async fn fetch_segment(
                     token_id: i.asset,
                     transaction_hash: i.transaction_hash,
                     ts_utc: None,
+                    effective_share: None,
                 }
             })
             .collect();
@@ -201,5 +203,48 @@ pub async fn sync_range(
         }
     }
 
+    // 同步后按时间序重算：REDEEM 的 effective_share 写入 activities，当前未平仓写入 open_positions
+    if let Err(e) = recompute_effective_share_and_open_positions(db_path, &addr) {
+        tracing::warn!(address = %addr, err = %e, "recompute effective_share and open_positions failed");
+    }
+
     Ok(total)
+}
+
+/// 按该地址全量活动重算 REDEEM 的 effective_share 与当前未平仓，并落库。
+fn recompute_effective_share_and_open_positions(db_path: &str, address: &str) -> Result<(), String> {
+    let (min_ts, max_ts) = match db::get_ts_range(db_path, address).map_err(|e| e.to_string())? {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let activities =
+        db::list_activities_in_range(db_path, address, min_ts, max_ts, 5_000_000).map_err(|e| e.to_string())?;
+    let (effective, open_positions) = valuation::effective_redeem_shares_and_open_positions(&activities);
+
+    let updates: Vec<(String, String, String, f64)> = activities
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            if row.type_.eq_ignore_ascii_case("REDEEM") {
+                effective.get(i).copied().flatten().map(|eff| {
+                    (
+                        row.transaction_hash.as_deref().unwrap_or("").to_string(),
+                        row.condition_id.as_deref().unwrap_or("").to_string(),
+                        row.token_id.as_deref().unwrap_or("").to_string(),
+                        eff,
+                    )
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let updates_ref: Vec<(&str, &str, &str, f64)> = updates
+        .iter()
+        .map(|(a, b, c, d)| (a.as_str(), b.as_str(), c.as_str(), *d))
+        .collect();
+    db::update_effective_share_for_redeems(db_path, address, &updates_ref).map_err(|e| e.to_string())?;
+    db::replace_open_positions(db_path, address, &open_positions).map_err(|e| e.to_string())?;
+    Ok(())
 }
