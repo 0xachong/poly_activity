@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>账户详情 - poly_activity</title>
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --card: #1a1a1e;
+      --text: #e4e4e7;
+      --text-muted: #a1a1aa;
+      --green: #22c55e;
+      --red: #ef4444;
+      --purple: #a78bfa;
+      --border: #27272a;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; padding: 1.5rem; }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1.5rem;
+    }
+    .header-left { display: flex; align-items: center; gap: 1rem; }
+    .avatar { width: 48px; height: 48px; border-radius: 50%; background: var(--purple); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1.25rem; }
+    .header-info .name { font-size: 1.1rem; font-weight: 600; }
+    .header-info .address { font-size: 0.8rem; color: var(--text-muted); font-family: monospace; display: flex; align-items: center; gap: 0.35rem; }
+    .header-info .address button { background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 0 0.25rem; }
+    .back-btn {
+      padding: 0.5rem 1rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 0.9rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+    .back-btn:hover { background: #27272a; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    @media (max-width: 900px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 500px) { .cards { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+    }
+    .card .label { color: var(--text-muted); font-size: 0.8rem; margin-bottom: 0.25rem; }
+    .card .value { font-size: 1.5rem; font-weight: 600; }
+    .card .value.positive { color: var(--green); }
+    .card .value.negative { color: var(--red); }
+    .card .value.neutral { color: #a78bfa; }
+    .card .sub { color: var(--text-muted); font-size: 0.75rem; margin-top: 0.35rem; }
+    .section-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+    .section-title h2 { margin: 0; font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 0.5rem; }
+    .calendar-wrap {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+      margin-bottom: 2rem;
+    }
+    .calendar-nav { display: flex; align-items: center; justify-content: flex-end; gap: 0.5rem; margin-bottom: 1rem; }
+    .calendar-nav button { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); padding: 0.35rem 0.75rem; cursor: pointer; }
+    .calendar-nav span { color: var(--text-muted); font-size: 0.95rem; min-width: 140px; text-align: center; }
+    .calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 0.5rem; }
+    .calendar-grid .weekday { color: var(--text-muted); font-size: 0.7rem; text-align: center; padding: 0.35rem; }
+    .day-cell {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.5rem;
+      min-height: 70px;
+      font-size: 0.8rem;
+    }
+    .day-cell.inactive { opacity: 0.4; }
+    .day-cell .day-num { font-weight: 600; margin-bottom: 0.25rem; }
+    .day-cell .vol { color: var(--text-muted); font-size: 0.7rem; }
+    .day-cell .pnl { font-weight: 600; margin-top: 0.2rem; }
+    .day-cell.positive .pnl { color: var(--green); }
+    .day-cell.negative .pnl { color: var(--red); }
+    .calendar-legend { color: var(--text-muted); font-size: 0.75rem; margin-top: 0.75rem; margin-bottom: 0; }
+    .positions-wrap {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+      overflow-x: auto;
+    }
+    .positions-wrap .section-title .pill { background: var(--purple); color: #fff; padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.8rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+    td.cond-id { font-size: 0.75rem; color: var(--text-muted); word-break: break-all; max-width: 140px; }
+    th { color: var(--text-muted); font-weight: 500; font-size: 0.8rem; }
+    .side-yes { background: rgba(34, 197, 94, 0.2); color: var(--green); padding: 0.2rem 0.5rem; border-radius: 6px; font-size: 0.8rem; }
+    .side-no { background: rgba(239, 68, 68, 0.2); color: var(--red); padding: 0.2rem 0.5rem; border-radius: 6px; font-size: 0.8rem; }
+    .error-msg { color: var(--red); font-size: 0.9rem; padding: 0.5rem 0; }
+    .loading { color: var(--text-muted); }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">
+      <div class="avatar" id="avatarLetter">M</div>
+      <div class="header-info">
+        <div class="name" id="accountName">--</div>
+        <div class="address">
+          <span id="walletAddress">--</span>
+          <button type="button" id="copyAddr" title="复制">📋</button>
+        </div>
+      </div>
+    </div>
+    <a href="dashboard.html" class="back-btn">← 返回总览</a>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">总盈亏 (Total P/L)</div>
+      <div class="value" id="totalPnl">--</div>
+      <div class="sub">历史累计</div>
+    </div>
+    <div class="card">
+      <div class="label">日回报率 (Daily Return Rate)</div>
+      <div class="value" id="dailyReturn">--</div>
+      <div class="sub">今日盈亏</div>
+    </div>
+    <div class="card">
+      <div class="label">月回报率 (Monthly Return Rate)</div>
+      <div class="value" id="monthlyReturn">--</div>
+      <div class="sub">月回报率</div>
+    </div>
+    <div class="card">
+      <div class="label">最大回撤 (Max Drawdown)</div>
+      <div class="value" id="maxDrawdown">--</div>
+      <div class="sub">Peak to trough</div>
+    </div>
+  </div>
+
+  <div class="calendar-wrap">
+    <div class="section-title">
+      <h2>📅 每日表现</h2>
+      <div class="calendar-nav">
+        <button type="button" id="prevMonth">←</button>
+        <span id="monthLabel">February 2026</span>
+        <button type="button" id="nextMonth">→</button>
+      </div>
+    </div>
+    <div class="calendar-grid" id="calendarGrid"></div>
+    <p class="calendar-legend">盈亏在卖出(Sell)、赎回(Redeem)、Claim 时产生（Claim 等价按 1 价格卖出）。买入不计入。成交量 = 当日买+卖+赎回+Claim 金额。</p>
+    <div id="calendarError" class="error-msg" style="display:none;"></div>
+  </div>
+
+  <div class="positions-wrap">
+    <div class="section-title">
+      <h2>🕐 Active Positions</h2>
+      <span class="pill" id="positionsCount">0 Active</span>
+    </div>
+    <div id="positionsError" class="error-msg" style="display:none;"></div>
+    <table id="positionsTable">
+      <thead>
+        <tr>
+          <th>MARKET</th>
+          <th>SIDE</th>
+          <th>SIZE</th>
+          <th>AVG PRICE</th>
+          <th>CUR PRICE</th>
+          <th>UNREALIZED PNL</th>
+          <th>开仓时间</th>
+          <th>CONDITION ID</th>
+        </tr>
+      </thead>
+      <tbody id="positionsBody"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const STORAGE_KEY = 'poly_activity_api_base';
+    const defaultBase = 'http://localhost:7001';
+
+    const params = new URLSearchParams(location.search);
+    const accountId = params.get('account_id') || '';
+    const displayName = params.get('display_name') || '';
+    const walletAddress = params.get('wallet_address') || '';
+
+    let currentYear = new Date().getFullYear();
+    let currentMonth = new Date().getMonth() + 1;
+
+    function getBase() {
+      return (localStorage.getItem(STORAGE_KEY) || defaultBase).replace(/\/$/, '');
+    }
+    async function fetchJson(path) {
+      const res = await fetch(getBase() + path);
+      if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+      return res.json();
+    }
+    function fmtMoney(n) {
+      if (n == null || Number.isNaN(n)) return '--';
+      return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    function fmtPct(n) {
+      if (n == null || Number.isNaN(n)) return '--';
+      return (Number(n) * 100).toFixed(2) + '%';
+    }
+
+    document.getElementById('accountName').textContent = displayName || accountId || walletAddress || '--';
+    document.getElementById('walletAddress').textContent = walletAddress || accountId || '--';
+    document.getElementById('avatarLetter').textContent = (displayName || accountId || 'M').charAt(0).toUpperCase();
+    document.getElementById('copyAddr').onclick = () => {
+      const addr = walletAddress || accountId;
+      if (addr && navigator.clipboard) navigator.clipboard.writeText(addr);
+    };
+
+    async function loadSummary() {
+      if (!accountId) return;
+      try {
+        const d = await fetchJson('/dashboard/accounts/' + encodeURIComponent(accountId) + '/summary');
+        document.getElementById('totalPnl').textContent = '$' + fmtMoney(d.total_pnl);
+        document.getElementById('totalPnl').className = 'value ' + (d.total_pnl > 0 ? 'positive' : d.total_pnl < 0 ? 'negative' : '');
+        document.getElementById('dailyReturn').textContent = fmtPct(d.daily_return_rate);
+        document.getElementById('dailyReturn').className = 'value ' + (d.daily_return_rate > 0 ? 'positive' : d.daily_return_rate < 0 ? 'negative' : 'neutral');
+        document.getElementById('monthlyReturn').textContent = fmtPct(d.monthly_return_rate);
+        document.getElementById('monthlyReturn').className = 'value ' + (d.monthly_return_rate > 0 ? 'positive' : d.monthly_return_rate < 0 ? 'negative' : 'neutral');
+        document.getElementById('maxDrawdown').textContent = '-' + fmtPct(d.max_drawdown).replace('%', '') + '%';
+        document.getElementById('maxDrawdown').className = 'value negative';
+      } catch (e) {
+        document.getElementById('totalPnl').textContent = 'Error';
+      }
+    }
+
+    const WEEKDAYS = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+    const MONTH_NAMES = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+    function renderCalendar() {
+      document.getElementById('monthLabel').textContent = MONTH_NAMES[currentMonth] + ' ' + currentYear;
+      const first = new Date(currentYear, currentMonth - 1, 1);
+      const last = new Date(currentYear, currentMonth, 0);
+      const startWeekday = first.getDay();
+      const daysInMonth = last.getDate();
+      const today = new Date();
+      const dayMap = window._dailyMap || {};
+      const grid = document.getElementById('calendarGrid');
+      grid.innerHTML = '';
+      WEEKDAYS.forEach(w => { const c = document.createElement('div'); c.className = 'weekday'; c.textContent = w; grid.appendChild(c); });
+      for (let i = 0; i < startWeekday; i++) {
+        const c = document.createElement('div');
+        c.className = 'day-cell inactive';
+        c.innerHTML = '<span class="day-num"></span>';
+        grid.appendChild(c);
+      }
+      for (let d = 1; d <= daysInMonth; d++) {
+        const dateStr = currentYear + '-' + String(currentMonth).padStart(2, '0') + '-' + String(d).padStart(2, '0');
+        const dayData = dayMap[dateStr];
+        const isFuture = new Date(currentYear, currentMonth - 1, d) > today;
+        const c = document.createElement('div');
+        c.className = 'day-cell' + (isFuture || !dayData ? ' inactive' : '');
+        if (dayData && !isFuture) {
+          if (dayData.pnl_delta > 0) c.classList.add('positive');
+          else if (dayData.pnl_delta < 0) c.classList.add('negative');
+        }
+        let vol = '$0';
+        let pnl = '--';
+        if (dayData && !isFuture) {
+          vol = dayData.volume >= 1000 ? '$' + (dayData.volume / 1000).toFixed(1) + 'K' : '$' + fmtMoney(dayData.volume);
+          pnl = (dayData.pnl_delta >= 0 ? '+' : '') + '$' + fmtMoney(dayData.pnl_delta);
+        }
+        c.innerHTML = '<div class="day-num">' + d + '</div><div class="vol">成交量: ' + vol + '</div><div class="pnl">' + pnl + '</div>';
+        grid.appendChild(c);
+      }
+    }
+
+    async function loadDaily() {
+      if (!accountId) return;
+      document.getElementById('calendarError').style.display = 'none';
+      try {
+        const d = await fetchJson('/dashboard/accounts/' + encodeURIComponent(accountId) + '/daily?year=' + currentYear + '&month=' + currentMonth);
+        const map = {};
+        (d.data || []).forEach(p => { map[p.date] = p; });
+        window._dailyMap = map;
+        renderCalendar();
+      } catch (e) {
+        document.getElementById('calendarError').style.display = 'block';
+        document.getElementById('calendarError').textContent = e.message || '加载失败';
+        window._dailyMap = {};
+        renderCalendar();
+      }
+    }
+
+    async function loadPositions() {
+      if (!accountId) return;
+      const body = document.getElementById('positionsBody');
+      const errEl = document.getElementById('positionsError');
+      const countEl = document.getElementById('positionsCount');
+      body.innerHTML = '<tr><td colspan="8" class="loading">加载中…</td></tr>';
+      errEl.style.display = 'none';
+      countEl.textContent = '—';
+      try {
+        const d = await fetchJson('/dashboard/accounts/' + encodeURIComponent(accountId) + '/positions');
+        const list = d.data || [];
+        countEl.textContent = list.length + ' Active';
+        body.innerHTML = '';
+        if (list.length === 0) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = '<td colspan="8" class="loading">无持仓记录。数据来自后端 activities：若该账户尚未同步，请先在「账户管理」页点击「同步全部」拉取链上活动。</td>';
+          body.appendChild(tr);
+        } else {
+          list.forEach(p => {
+            const tr = document.createElement('tr');
+            const sideClass = (p.side || '').toLowerCase() === 'yes' ? 'side-yes' : 'side-no';
+            const pnlClass = p.unrealized_pnl >= 0 ? 'positive' : 'negative';
+            tr.innerHTML =
+              '<td>' + (p.market || '—') + '</td>' +
+              '<td><span class="' + sideClass + '">' + (p.side || '—') + '</span></td>' +
+              '<td>' + fmtMoney(p.size) + '</td>' +
+              '<td>$' + fmtMoney(p.avg_price) + '</td>' +
+              '<td>$' + fmtMoney(p.cur_price) + '</td>' +
+              '<td class="' + pnlClass + '">' + (p.unrealized_pnl >= 0 ? '+' : '') + '$' + fmtMoney(p.unrealized_pnl) + '</td>' +
+              '<td>' + (p.open_time || '—') + '</td>' +
+              '<td class="cond-id">' + (p.condition_id || '—') + '</td>';
+            body.appendChild(tr);
+          });
+        }
+      } catch (e) {
+        body.innerHTML = '';
+        errEl.style.display = 'block';
+        errEl.textContent = '请求失败: ' + (e.message || '加载失败') + '。请确认 API 地址正确且后端已启动。';
+        countEl.textContent = '0 Active';
+      }
+    }
+
+    document.getElementById('prevMonth').onclick = () => {
+      if (currentMonth === 1) { currentYear--; currentMonth = 12; } else currentMonth--;
+      loadDaily();
+    };
+    document.getElementById('nextMonth').onclick = () => {
+      if (currentMonth === 12) { currentYear++; currentMonth = 1; } else currentMonth++;
+      loadDaily();
+    };
+
+    if (accountId) {
+      currentYear = new Date().getFullYear();
+      currentMonth = new Date().getMonth() + 1;
+      Promise.all([loadSummary(), loadDaily(), loadPositions()]);
+    } else {
+      document.getElementById('totalPnl').textContent = '请从总览选择账户';
+    }
+  </script>
+</body>
+</html>

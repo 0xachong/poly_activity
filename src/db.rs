@@ -1,13 +1,7 @@
-//! DuckDB 存储：schema、钱包进度、Activity 读写
+//! DuckDB 存储：仅 activities 表及读写
 
-use duckdb::{params, Connection, OptionalExt, Result};
+use duckdb::{params, Connection, Result};
 use std::path::Path;
-
-fn ts_to_utc_str(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_default()
-}
 
 /// 单条 Activity 记录（与表结构一致）
 #[derive(Clone, Debug)]
@@ -17,6 +11,7 @@ pub struct ActivityRow {
     pub type_: String,
     pub share: Option<f64>,
     pub price: Option<f64>,
+    pub usdc_size: Option<f64>,
     pub title: Option<String>,
     pub outcome: Option<String>,
     pub condition_id: Option<String>,
@@ -33,22 +28,17 @@ fn open(path: &str) -> Result<Connection> {
     Connection::open(path)
 }
 
-/// 初始化 schema，若表已存在则跳过
+/// 初始化 schema：仅 activities 表
 pub fn init_schema(path: &str) -> Result<()> {
     let conn = open(path)?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS wallets (
-            address VARCHAR PRIMARY KEY,
-            latest_activity_ts BIGINT,
-            created_at TIMESTAMP DEFAULT now(),
-            updated_at TIMESTAMP DEFAULT now()
-        );
-        CREATE TABLE IF NOT EXISTS activities (
+        "CREATE TABLE IF NOT EXISTS activities (
             address VARCHAR,
             ts BIGINT,
             type VARCHAR,
             share DOUBLE,
             price DOUBLE,
+            usdc_size DOUBLE,
             title VARCHAR,
             outcome VARCHAR,
             condition_id VARCHAR,
@@ -57,12 +47,13 @@ pub fn init_schema(path: &str) -> Result<()> {
             ts_utc VARCHAR,
             PRIMARY KEY (address, transaction_hash, condition_id, token_id)
         );
-        CREATE INDEX IF NOT EXISTS idx_activities_address_ts ON activities(address, ts);",
+        CREATE INDEX IF NOT EXISTS idx_activities_address_ts ON activities(address, ts);
+        ALTER TABLE activities ADD COLUMN IF NOT EXISTS usdc_size DOUBLE;",
     )?;
     Ok(())
 }
 
-/// 取该地址在库中的 ts 区间 (min, max)；无记录返回 None
+/// 该地址在库中的 ts 区间 (min, max)；无记录返回 None
 pub fn get_ts_range(path: &str, address: &str) -> Result<Option<(i64, i64)>> {
     let conn = open(path)?;
     let addr = address.to_lowercase();
@@ -82,63 +73,49 @@ pub fn get_ts_range(path: &str, address: &str) -> Result<Option<(i64, i64)>> {
     })
 }
 
-/// 取该地址已缓存的最大时间戳；无记录返回 None
-pub fn get_latest_ts(path: &str, address: &str) -> Result<Option<i64>> {
+/// 删除该地址下全部 activities（用于 force_refresh 时清空后重拉）
+pub fn delete_activities_for_address(path: &str, address: &str) -> Result<u64> {
     let conn = open(path)?;
     let addr = address.to_lowercase();
-    let out: Option<Option<i64>> = conn
-        .query_row(
-            "SELECT latest_activity_ts FROM wallets WHERE address = ?",
-            [&addr],
-            |r| r.get::<_, Option<i64>>(0),
-        )
-        .optional()?;
-    if let Some(Some(ts)) = out {
-        return Ok(Some(ts));
-    }
-    // max(ts) 无记录时为 NULL，需按 Option 读取
-    let max_ts: Option<i64> = conn.query_row(
-        "SELECT max(ts) FROM activities WHERE address = ?",
-        [&addr],
-        |r| r.get::<_, Option<i64>>(0),
-    )?;
-    Ok(max_ts)
+    let n = conn.execute("DELETE FROM activities WHERE address = ?", [&addr])?;
+    Ok(n as u64)
 }
 
-/// 更新钱包的 latest_activity_ts
-pub fn upsert_wallet_ts(path: &str, address: &str, ts: i64) -> Result<()> {
-    let conn = open(path)?;
-    let addr = address.to_lowercase();
-    conn.execute(
-        "INSERT INTO wallets (address, latest_activity_ts, created_at, updated_at)
-         VALUES (?, ?, now(), now())
-         ON CONFLICT (address) DO UPDATE SET latest_activity_ts = excluded.latest_activity_ts, updated_at = now()",
-        params![addr, ts],
-    )?;
-    Ok(())
-}
-
-/// 批量写入 Activity，唯一冲突则忽略
+/// 批量写入 Activity，唯一冲突则更新
 pub fn insert_activities_batch(path: &str, rows: &[ActivityRow]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
     let conn = open(path)?;
+    fn ts_to_utc_str(ts: i64) -> String {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_default()
+    }
     for r in rows {
         let addr = r.address.to_lowercase();
         let cond_id = r.condition_id.as_deref().unwrap_or("");
         let tok_id = r.token_id.as_deref().unwrap_or("");
         let ts_utc = r.ts_utc.clone().unwrap_or_else(|| ts_to_utc_str(r.ts));
         let _ = conn.execute(
-            "INSERT INTO activities (address, ts, type, share, price, title, outcome, condition_id, token_id, transaction_hash, ts_utc)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (address, transaction_hash, condition_id, token_id) DO NOTHING",
+            "INSERT INTO activities (address, ts, type, share, price, usdc_size, title, outcome, condition_id, token_id, transaction_hash, ts_utc)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (address, transaction_hash, condition_id, token_id) DO UPDATE SET
+                ts = excluded.ts,
+                type = excluded.type,
+                share = COALESCE(share, excluded.share),
+                price = CASE WHEN (price IS NULL OR price = 0) AND excluded.price IS NOT NULL THEN excluded.price ELSE price END,
+                usdc_size = COALESCE(usdc_size, excluded.usdc_size),
+                title = COALESCE(title, excluded.title),
+                outcome = COALESCE(outcome, excluded.outcome),
+                ts_utc = COALESCE(ts_utc, excluded.ts_utc)",
             params![
                 addr,
                 r.ts,
                 r.type_,
                 r.share,
                 r.price,
+                r.usdc_size,
                 r.title.as_deref(),
                 r.outcome.as_deref(),
                 cond_id,
@@ -146,12 +123,12 @@ pub fn insert_activities_batch(path: &str, rows: &[ActivityRow]) -> Result<()> {
                 r.transaction_hash.as_deref(),
                 &ts_utc,
             ],
-        );
+        )?;
     }
     Ok(())
 }
 
-/// 按时间区间查询：ts BETWEEN from_ts AND to_ts，倒序，取前 limit 条；type_filter 为空表示不过滤
+/// 按时间区间查询：ts 在 [from_ts, to_ts]，按 ts 倒序，最多 limit 条；type_filter 为空则不过滤
 pub fn list_activities(
     path: &str,
     address: &str,
@@ -180,12 +157,12 @@ pub fn list_activities(
 
     let rows: Vec<ActivityRow> = if let Some(t) = type_filter {
         let mut stmt = conn.prepare(
-            "SELECT address, ts, type, share, price, title, outcome, condition_id, token_id, transaction_hash, ts_utc FROM activities WHERE address = ? AND ts >= ? AND ts <= ? AND type = ? ORDER BY ts DESC LIMIT ?",
+            "SELECT address, ts, type, share, price, usdc_size, title, outcome, condition_id, token_id, transaction_hash, ts_utc FROM activities WHERE address = ? AND ts >= ? AND ts <= ? AND type = ? ORDER BY ts DESC LIMIT ?",
         )?;
         stmt.query_map(params![addr, from_ts, to_ts, t, limit_i], map_row)?.collect::<Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare(
-            "SELECT address, ts, type, share, price, title, outcome, condition_id, token_id, transaction_hash, ts_utc FROM activities WHERE address = ? AND ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT ?",
+            "SELECT address, ts, type, share, price, usdc_size, title, outcome, condition_id, token_id, transaction_hash, ts_utc FROM activities WHERE address = ? AND ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT ?",
         )?;
         stmt.query_map(params![addr, from_ts, to_ts, limit_i], map_row)?.collect::<Result<Vec<_>>>()?
     };
@@ -200,70 +177,33 @@ fn map_row(row: &duckdb::Row) -> Result<ActivityRow> {
         type_: row.get(2)?,
         share: row.get(3)?,
         price: row.get(4)?,
-        title: row.get(5)?,
-        outcome: row.get(6)?,
-        condition_id: row.get(7)?,
-        token_id: row.get(8)?,
-        transaction_hash: row.get(9)?,
-        ts_utc: row.get(10)?,
+        usdc_size: row.get(5)?,
+        title: row.get(6)?,
+        outcome: row.get(7)?,
+        condition_id: row.get(8)?,
+        token_id: row.get(9)?,
+        transaction_hash: row.get(10)?,
+        ts_utc: row.get(11)?,
     })
 }
 
-/// 列出所有已登记/已缓存钱包
-pub fn list_wallets(path: &str) -> Result<Vec<(String, Option<i64>)>> {
-    let conn = open(path)?;
-    let mut stmt = conn.prepare("SELECT address, latest_activity_ts FROM wallets ORDER BY updated_at DESC")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))?.collect::<Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-/// 登记钱包（仅 INSERT，若已存在则忽略）
-pub fn register_wallet(path: &str, address: &str) -> Result<()> {
+/// 按时间区间查活动，按 ts 升序，limit 可大（供 valuation 用）
+pub fn list_activities_in_range(
+    path: &str,
+    address: &str,
+    from_ts: i64,
+    to_ts: i64,
+    limit: u32,
+) -> Result<Vec<ActivityRow>> {
     let conn = open(path)?;
     let addr = address.to_lowercase();
-    conn.execute(
-        "INSERT INTO wallets (address, latest_activity_ts) VALUES (?, NULL) ON CONFLICT (address) DO NOTHING",
-        [&addr],
-    )?;
-    Ok(())
-}
-
-/// 缓存概况：地址数、全库 ts 起止、活动条数
-#[derive(Debug, Default)]
-pub struct CacheSummary {
-    pub address_count: u64,
-    pub min_ts: Option<i64>,
-    pub max_ts: Option<i64>,
-    pub record_count: u64,
-}
-
-/// 获取缓存钱包数据概况
-pub fn get_cache_summary(path: &str) -> Result<CacheSummary> {
-    let conn = open(path)?;
-    let address_count: u64 = conn.query_row(
-        "SELECT COUNT(DISTINCT address) FROM activities",
-        [],
-        |r| r.get(0),
-    )?;
-    let record_count: u64 = conn.query_row("SELECT COUNT(*) FROM activities", [], |r| r.get(0))?;
-    let min_ts: Option<i64> = conn.query_row("SELECT min(ts) FROM activities", [], |r| r.get(0))?;
-    let max_ts: Option<i64> = conn.query_row("SELECT max(ts) FROM activities", [], |r| r.get(0))?;
-    Ok(CacheSummary {
-        address_count,
-        min_ts,
-        max_ts,
-        record_count,
-    })
-}
-
-/// 每个地址缓存的条数，按条数降序
-pub fn list_address_record_counts(path: &str) -> Result<Vec<(String, u64)>> {
-    let conn = open(path)?;
+    let limit_i = limit.min(5_000_000) as i64;
     let mut stmt = conn.prepare(
-        "SELECT address, COUNT(*) AS cnt FROM activities GROUP BY address ORDER BY cnt DESC",
+        "SELECT address, ts, type, share, price, usdc_size, title, outcome, condition_id, token_id, transaction_hash, ts_utc
+         FROM activities WHERE address = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC LIMIT ?",
     )?;
-    let list = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+    let rows = stmt
+        .query_map(params![addr, from_ts, to_ts, limit_i], map_row)?
         .collect::<Result<Vec<_>>>()?;
-    Ok(list)
+    Ok(rows)
 }

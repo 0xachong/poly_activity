@@ -1,4 +1,5 @@
-//! 单钱包同步：按 start→end 分批拉取 Polymarket Activity，限流、去重写入
+//! 单钱包同步：按 start→end 分批拉取 Polymarket Activity，限流、去重写入。
+//! 官方 API 仅返回 REDEEM（兑付/领奖），无 CLAIM 类型。
 
 use crate::config::Config;
 use crate::db::{self, ActivityRow};
@@ -17,6 +18,8 @@ struct PolyActivityItem {
     #[serde(rename = "type")]
     type_: Option<String>,
     size: Option<f64>,
+    #[serde(rename = "usdcSize")]
+    usdc_size: Option<f64>,
     #[serde(rename = "transactionHash")]
     transaction_hash: Option<String>,
     price: Option<f64>,
@@ -24,6 +27,15 @@ struct PolyActivityItem {
     side: Option<String>,
     title: Option<String>,
     outcome: Option<String>,
+}
+
+/// 存款/提款不落库，仅用于 API 拉取时的过滤
+fn is_deposit_or_withdraw(type_str: Option<&str>) -> bool {
+    let u = type_str.unwrap_or("").to_uppercase();
+    matches!(
+        u.as_str(),
+        "DEPOSIT" | "DEPOSITS" | "WITHDRAW" | "WITHDRAWAL" | "WITHDRAWALS"
+    )
 }
 
 /// 拉取 [seg_start, seg_end] 从 Polymarket 并写入 DB，返回本段新增条数
@@ -47,8 +59,9 @@ async fn fetch_segment(
     loop {
         rate_limiter.acquire().await;
 
+        // 注意：Polymarket Data API /activity 的 type 仅含 TRADE/SPLIT/MERGE/REDEEM/REWARD/CONVERSION/MAKER_REBATE，不包含 DEPOSIT/WITHDRAW，存款无法从此接口拉到
         let url = format!(
-            "{}/activity?user={}&start={}&end={}&sortBy=TIMESTAMP&sortDirection=ASC&limit={}&excludeDepositsWithdrawals=false",
+            "{}/activity?user={}&start={}&end={}&sortBy=TIMESTAMP&sortDirection=ASC&limit={}&excludeDepositsWithdrawals=true",
             config.poly_api_base.trim_end_matches('/'),
             addr,
             batch_start,
@@ -84,7 +97,14 @@ async fn fetch_segment(
             tracing::warn!(err = %e, "poly response body failed");
             msg
         })?;
-        let items: Vec<PolyActivityItem> = serde_json::from_str(&body).unwrap_or_default();
+        let items: Vec<PolyActivityItem> = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                let preview = body.chars().take(300).collect::<String>();
+                tracing::error!(err = %e, body_preview = %preview, "poly response JSON parse failed，本批数据未写入，可能漏数据");
+                return Err(format!("poly response JSON parse failed: {}", e));
+            }
+        };
         let type_counts: std::collections::HashMap<String, usize> =
             items.iter().fold(std::collections::HashMap::new(), |mut m, i| {
                 *m.entry(i.type_.clone().unwrap_or_default()).or_insert(0) += 1;
@@ -96,22 +116,24 @@ async fn fetch_segment(
             break;
         }
 
+        // 统一按请求时的钱包地址 addr 写入，不按 API 返回的 proxy_wallet，否则按 account.wallet_address 查不到活动，资产/交易会对不上；存款/提款不存储
         let rows: Vec<ActivityRow> = items
             .into_iter()
+            .filter(|i| !is_deposit_or_withdraw(i.type_.as_deref()))
             .map(|i| {
                 let ts = i.timestamp.unwrap_or(0);
-                let addr_use = i.proxy_wallet.as_deref().unwrap_or(addr).to_string();
                 let type_merged = match (i.type_.as_deref(), i.side.as_deref()) {
                     (Some("TRADE"), Some(s)) if s == "BUY" || s == "SELL" => s.to_string(),
                     (Some(t), _) => t.to_string(),
                     _ => String::new(),
                 };
                 ActivityRow {
-                    address: addr_use.to_lowercase(),
+                    address: addr.to_string(),
                     ts,
                     type_: type_merged,
                     share: i.size,
                     price: i.price,
+                    usdc_size: i.usdc_size,
                     title: i.title,
                     outcome: i.outcome,
                     condition_id: i.condition_id,
@@ -127,12 +149,12 @@ async fn fetch_segment(
         total_inserted += n;
 
         let max_ts = rows.iter().map(|r| r.ts).max().unwrap_or(batch_start);
-        db::upsert_wallet_ts(db_path, addr, max_ts).map_err(|e| e.to_string())?;
 
         if n < limit as u64 {
             break;
         }
-        batch_start = max_ts + 1;
+        // 下一批从 max_ts 开始（不 +1），避免同一秒有多条时漏拉；重复项由 ON CONFLICT DO NOTHING 去重
+        batch_start = max_ts;
         if batch_start > seg_end {
             break;
         }
@@ -141,7 +163,7 @@ async fn fetch_segment(
     Ok(total_inserted)
 }
 
-/// 按请求区间 [from_ts, to_ts] 同步：取库中已有区间 [from1, to1]，先拉左缺口 [from_ts, from1)，再拉右缺口 (to1, to_ts]，最后查库即得三段合并结果。
+/// 按请求区间 [from_ts, to_ts] 同步：取库中已有区间补缺口拉取并写入。
 pub async fn sync_range(
     config: &Config,
     db_path: &str,

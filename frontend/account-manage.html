@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>账户管理 - poly_activity</title>
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --card: #1a1a1e;
+      --text: #e4e4e7;
+      --text-muted: #a1a1aa;
+      --green: #22c55e;
+      --red: #ef4444;
+      --purple: #a78bfa;
+      --blue: #3b82f6;
+      --border: #27272a;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; padding: 1.5rem; }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 2rem;
+    }
+    .header h1 { margin: 0; font-size: 1.35rem; font-weight: 600; }
+    .header-right { display: flex; align-items: center; gap: 0.75rem; }
+    .dropdown {
+      padding: 0.5rem 0.75rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .dropdown .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+    .page-title { margin-bottom: 0.5rem; font-size: 1.25rem; font-weight: 600; }
+    .page-sub { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
+    .toolbar { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
+    .btn {
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--text);
+    }
+    .btn:hover { background: #27272a; }
+    .btn-primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+    .btn-primary:hover { opacity: 0.9; }
+    .account-group { margin-bottom: 1.25rem; }
+    .account-group-title { font-size: 0.85rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0.5rem; text-transform: capitalize; }
+    .account-list { display: flex; flex-direction: column; gap: 0.75rem; }
+    .account-row {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 1rem 1.25rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+    .account-row .avatar { width: 44px; height: 44px; border-radius: 50%; background: var(--purple); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1.1rem; flex-shrink: 0; }
+    .account-row .info { flex: 1; min-width: 0; }
+    .account-row .name { font-weight: 600; display: flex; align-items: center; gap: 0.35rem; }
+    .account-row .name .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+    .account-row .address { font-size: 0.8rem; color: var(--text-muted); font-family: monospace; display: flex; align-items: center; gap: 0.25rem; }
+    .account-row .address button { background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 0 0.2rem; }
+    .account-row .status { font-size: 0.8rem; color: var(--green); margin-top: 0.2rem; }
+    .account-row .actions { display: flex; align-items: center; gap: 0.5rem; }
+    .account-row .actions button { background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 0.35rem; border-radius: 6px; }
+    .account-row .actions button:hover { background: #27272a; color: var(--text); }
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 100;
+    }
+    .modal-overlay.hidden { display: none; }
+    .modal {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      width: 90%; max-width: 480px;
+    }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+    .modal-header h2 { margin: 0; font-size: 1.1rem; }
+    .modal-header .close { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 1.25rem; padding: 0 0.25rem; }
+    .modal-header .close:hover { color: var(--text); }
+    .modal .hint { color: var(--text-muted); font-size: 0.8rem; margin-bottom: 0.5rem; }
+    .modal textarea {
+      width: 100%; min-height: 140px; padding: 0.75rem;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      color: var(--text); font-family: inherit; font-size: 0.85rem;
+      resize: vertical;
+    }
+    .modal .buttons { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1rem; }
+    .api-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+    }
+    .api-bar label { color: var(--text-muted); font-size: 0.875rem; }
+    .api-bar input {
+      width: 260px;
+      padding: 0.5rem 0.75rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+    }
+    .api-bar button { padding: 0.5rem 0.75rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--text); cursor: pointer; font-size: 0.875rem; }
+    .api-bar button:hover { background: #27272a; }
+    .footer { text-align: center; color: var(--text-muted); font-size: 0.75rem; margin-top: 2rem; }
+    .loading { color: var(--text-muted); }
+    .loading code { background: var(--border); padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.85em; }
+    .error-msg { color: var(--red); font-size: 0.9rem; }
+    a { color: var(--text); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>账户管理</h1>
+    <div class="header-right">
+      <a href="dashboard.html" class="dropdown">
+        <span class="dot"></span>
+        <span id="headerAccountName">总览</span>
+        <span>▼</span>
+      </a>
+    </div>
+  </div>
+
+  <div class="page-title">账户管理</div>
+  <div class="page-sub">Manage your Polymarket wallet addresses</div>
+  <div class="api-bar">
+    <label for="apiBase">API 地址</label>
+    <input id="apiBase" type="text" placeholder="http://localhost:7001" />
+    <button type="button" id="saveApi">保存</button>
+    <button type="button" id="reloadList">刷新列表</button>
+  </div>
+  <div class="toolbar">
+    <button type="button" class="btn btn-primary" id="batchImportBtn">Batch Import Wallets</button>
+    <button type="button" class="btn" id="syncAllBtn">同步全部（拉取链上活动）</button>
+    <a href="dashboard.html" class="btn">返回总览</a>
+  </div>
+  <div id="listError" class="error-msg" style="display:none;"></div>
+  <div id="accountList"></div>
+
+  <div class="modal-overlay hidden" id="modalOverlay">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>Batch Import Wallets</h2>
+        <button type="button" class="close" id="modalClose">×</button>
+      </div>
+      <div class="hint">Format (one per line):</div>
+      <div class="hint">0x1234...abcd, Main Wallet &nbsp;或&nbsp; 0xabcd...1234, Degen Fund</div>
+      <div class="hint">或 第一列名称、第二列地址（Tab/空格分隔）：chongwebdev &nbsp;0x38cc... &nbsp;| &nbsp;poly02 &nbsp;0x20Ac...</div>
+      <textarea id="batchInput" placeholder="Paste addresses here..."></textarea>
+      <div class="buttons">
+        <button type="button" class="btn" id="modalCancel">Cancel</button>
+        <button type="button" class="btn btn-primary" id="modalImport">Import</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">由自定义后端驱动。数据非直接来自 Polymarket.</div>
+
+  <script>
+    const STORAGE_KEY = 'poly_activity_api_base';
+    const defaultBase = 'http://localhost:7001';
+
+    function getBase() {
+      const el = document.getElementById('apiBase');
+      const v = (el && el.value && el.value.trim()) || localStorage.getItem(STORAGE_KEY) || defaultBase;
+      return v.replace(/\/$/, '');
+    }
+    function setBase(v) {
+      const el = document.getElementById('apiBase');
+      if (el) el.value = v || defaultBase;
+    }
+    async function fetchJson(path, opts) {
+      const res = await fetch(getBase() + path, opts);
+      if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+      if (res.status === 204) return null;
+      return res.json();
+    }
+
+    function truncateAddr(addr) {
+      if (!addr || addr.length < 14) return addr;
+      return addr.slice(0, 6) + '...' + addr.slice(-4);
+    }
+
+    function getGroupKey(displayName) {
+      const name = (displayName || '').trim();
+      const m = name.match(/^([a-zA-Z]+)/);
+      return m ? m[1].toLowerCase() : 'other';
+    }
+
+    async function loadList() {
+      const listEl = document.getElementById('accountList');
+      const errEl = document.getElementById('listError');
+      listEl.innerHTML = '';
+      errEl.style.display = 'none';
+      try {
+        const d = await fetchJson('/accounts');
+        const list = d.data || [];
+        if (list.length > 0) document.getElementById('headerAccountName').textContent = list[0].display_name || list[0].account_id || '账户';
+        if (list.length === 0) {
+          listEl.innerHTML =
+            '<p class="loading">暂无账户。请确认：<br>1) 后端已启动（如 <code>cargo run</code>）；<br>2) 上方 API 地址正确（当前：' + getBase() + '）；<br>3) 已点击「Batch Import Wallets」粘贴地址并导入，或已用脚本执行过 <code>POST /accounts/batch</code>。</p>';
+          return;
+        }
+        const byGroup = {};
+        list.forEach(acc => {
+          const key = getGroupKey(acc.display_name || acc.account_id);
+          if (!byGroup[key]) byGroup[key] = [];
+          byGroup[key].push(acc);
+        });
+        const groupKeys = Object.keys(byGroup).sort();
+        groupKeys.forEach(key => {
+          const accs = byGroup[key].sort((a, b) => (a.display_name || a.account_id || '').localeCompare(b.display_name || b.account_id || ''));
+          const section = document.createElement('div');
+          section.className = 'account-group';
+          section.innerHTML = '<div class="account-group-title">' + key + '</div><div class="account-list"></div>';
+          const rowContainer = section.querySelector('.account-list');
+          accs.forEach(acc => {
+            const row = document.createElement('div');
+            row.className = 'account-row';
+            const name = acc.display_name || acc.account_id || '—';
+            const initial = (name === '—' ? '?' : name).charAt(0).toUpperCase();
+            const detailUrl = 'account-detail.html?account_id=' + encodeURIComponent(acc.account_id || '') +
+              '&display_name=' + encodeURIComponent(acc.display_name || '') + '&wallet_address=' + encodeURIComponent(acc.wallet_address || '');
+            row.innerHTML =
+              '<div class="avatar">' + initial + '</div>' +
+              '<div class="info">' +
+                '<div class="name"><span class="dot"></span><a href="' + detailUrl + '">' + name + '</a></div>' +
+                '<div class="address"><span class="addr">' + truncateAddr(acc.wallet_address || acc.account_id) + '</span> <button type="button" title="复制">📋</button></div>' +
+                '<div class="status">' + (acc.synced ? 'Synced' : 'Not synced') + '</div>' +
+              '</div>' +
+              '<div class="actions">' +
+                '<button type="button" title="刷新聚合">🔄</button>' +
+                '<button type="button" title="删除">🗑</button>' +
+              '</div>';
+            const addrFull = acc.wallet_address || acc.account_id;
+            row.querySelector('.address button').onclick = (e) => { e.preventDefault(); e.stopPropagation(); if (addrFull && navigator.clipboard) navigator.clipboard.writeText(addrFull); };
+            row.querySelector('.actions button').onclick = async (e) => {
+              e.preventDefault();
+              try { await fetch(getBase() + '/dashboard/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ account_ids: [acc.account_id] }) }); loadList(); } catch (_) {}
+            };
+            row.querySelectorAll('.actions button')[1].onclick = async (e) => {
+              e.preventDefault();
+              if (!confirm('确定删除账户 “‘ + name + '”？')) return;
+              try { await fetch(getBase() + '/accounts/' + encodeURIComponent(acc.account_id), { method: 'DELETE' }); loadList(); } catch (err) { alert(err.message); }
+            };
+            rowContainer.appendChild(row);
+          });
+          listEl.appendChild(section);
+        });
+      } catch (e) {
+        errEl.style.display = 'block';
+        errEl.textContent = '加载失败: ' + (e.message || '') + '。当前请求地址：' + getBase();
+      }
+    }
+
+    const modal = document.getElementById('modalOverlay');
+    const batchInput = document.getElementById('batchInput');
+    document.getElementById('batchImportBtn').onclick = () => { batchInput.value = ''; modal.classList.remove('hidden'); };
+    document.getElementById('modalClose').onclick = () => modal.classList.add('hidden');
+    document.getElementById('modalCancel').onclick = () => modal.classList.add('hidden');
+    modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
+    document.querySelector('.modal').onclick = (e) => e.stopPropagation();
+
+    setBase(localStorage.getItem(STORAGE_KEY) || defaultBase);
+    document.getElementById('saveApi').addEventListener('click', () => {
+      const v = document.getElementById('apiBase').value.trim();
+      localStorage.setItem(STORAGE_KEY, v || defaultBase);
+    });
+    document.getElementById('reloadList').addEventListener('click', loadList);
+
+    document.getElementById('syncAllBtn').onclick = async () => {
+      const btn = document.getElementById('syncAllBtn');
+      const orig = btn.textContent;
+      const url = getBase() + '/sync/run';
+      console.log('[同步全部] 开始请求', url);
+      btn.disabled = true;
+      btn.textContent = '同步中…';
+      try {
+        const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+        console.log('[同步全部] 响应', res.status, res.statusText);
+        const data = await res.json().catch(() => ({}));
+        console.log('[同步全部] 响应体', data);
+        btn.textContent = '同步全部（拉取链上活动）';
+        if (!res.ok) throw new Error(data.message || res.statusText || '同步失败');
+        console.log('[同步全部] 成功 账户数=', data.synced_count, '新增活动=', data.total_activities_added);
+        alert('已同步 ' + (data.synced_count || 0) + ' 个账户，新增 ' + (data.total_activities_added || 0) + ' 条活动。');
+        console.log('[同步全部] 刷新列表…');
+        loadList();
+      } catch (e) {
+        console.warn('[同步全部] 失败', e);
+        btn.textContent = orig;
+        alert(e.message || '同步失败');
+      } finally {
+        btn.disabled = false;
+        console.log('[同步全部] 结束');
+      }
+    };
+
+    document.getElementById('modalImport').onclick = async () => {
+      const raw = batchInput.value.trim();
+      const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      const items = [];
+      for (const line of lines) {
+        let wallet = '';
+        let display_name = null;
+        const commaIdx = line.indexOf(',');
+        if (commaIdx > 0) {
+          wallet = line.slice(0, commaIdx).trim();
+          display_name = line.slice(commaIdx + 1).trim() || null;
+        } else {
+          const parts = line.split(/\t|\s+/).filter(Boolean);
+          const addrPart = parts.find(p => p.toLowerCase().startsWith('0x'));
+          if (addrPart) {
+            wallet = addrPart;
+            const namePart = parts.filter(p => p !== addrPart).join(' ').trim();
+            if (namePart) display_name = namePart;
+          }
+        }
+        if (wallet.startsWith('0x') && wallet.length >= 10) items.push({ wallet_address: wallet, display_name });
+      }
+      if (items.length === 0) { alert('未解析到有效地址。支持格式：\n每行 0x地址 或 0x地址, 名称\n或 名称\\t0x地址（第一列分组编号，第二列地址）'); return; }
+      try {
+        await fetch(getBase() + '/accounts/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items }),
+        });
+        modal.classList.add('hidden');
+        loadList();
+      } catch (e) {
+        alert(e.message || '导入失败');
+      }
+    };
+
+    loadList();
+  </script>
+</body>
+</html>

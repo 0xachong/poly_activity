@@ -1,16 +1,19 @@
-//! Polymarket 钱包 Activity 缓存后端：按查询触发同步、时间区间 API、紧凑 JSON
+//! Polymarket 钱包 Activity 缓存后端：仅两个 API（历史交易 + 每日交易额/利润）
 
 mod api;
 mod config;
 mod db;
 mod rate_limit;
 mod sync;
+mod valuation;
+mod positions;
 
 use std::sync::Arc;
 
 use api::{router, AppState};
 use config::Config;
 use rate_limit::RateLimiter;
+use tower_http::cors::{Any, CorsLayer};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,7 +41,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client,
     });
 
-    let app = router(state);
+    let app = router(state).layer(
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    );
     let bind = format!("0.0.0.0:{}", config.http_port);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("listening on http://{}", bind);

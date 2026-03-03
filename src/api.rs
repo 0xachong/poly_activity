@@ -1,4 +1,4 @@
-//! HTTP API：时间区间查询、紧凑 JSON
+//! HTTP API：仅两个接口——某钱包某段时间历史交易、指定区间每日交易额与已实现利润
 
 use axum::{
     extract::{Path, Query, State},
@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::db;
 use crate::rate_limit::RateLimiter;
 use crate::sync;
+use crate::valuation;
 use reqwest::Client;
 
 pub struct AppState {
@@ -29,6 +30,9 @@ pub struct ActivityQuery {
     #[serde(default = "default_limit")]
     pub limit: u32,
     pub r#type: Option<String>,
+    /// 为 true 时先清空该钱包本地数据，再从 Polymarket 从 0 重拉后返回
+    #[serde(default)]
+    pub force_refresh: bool,
 }
 
 fn default_limit() -> u32 {
@@ -66,12 +70,41 @@ pub struct ActivityResponse {
     pub data: Vec<ActivityItemCompact>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BatchActivityBody {
+    pub addresses: Vec<String>,
+    pub from_ts: i64,
+    #[serde(default)]
+    pub to_ts: Option<i64>,
+    #[serde(default = "default_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub force_refresh: bool,
+}
+
+#[derive(Serialize)]
+pub struct WalletActivityItem {
+    pub address: String,
+    pub total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_time: Option<String>,
+    pub data: Vec<ActivityItemCompact>,
+}
+
+#[derive(Serialize)]
+pub struct BatchActivityResponse {
+    pub data: Vec<WalletActivityItem>,
+}
+
 #[derive(Serialize)]
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
 }
 
+/// GET /wallets/:address/activity — 某钱包某段时间历史交易；force_refresh=true 时清空后从 Polymarket 重拉
 async fn get_wallet_activity(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
@@ -97,28 +130,61 @@ async fn get_wallet_activity(
         ));
     }
 
-    sync::sync_range(
-        &state.config,
-        &state.config.duckdb_path,
-        state.rate_limiter.as_ref(),
-        &state.client,
-        &addr,
-        from_ts,
-        to_ts,
-    )
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorBody {
-                code: "SYNC_ERROR".into(),
-                message: e,
-            }),
+    let path = &state.config.duckdb_path;
+    if q.force_refresh {
+        let n = db::delete_activities_for_address(path, &addr).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    code: "DB_ERROR".into(),
+                    message: e.to_string(),
+                }),
+            )
+        })?;
+        tracing::info!(address = %addr, deleted = n, "force_refresh: cleared activities");
+        sync::sync_range(
+            &state.config,
+            path,
+            state.rate_limiter.as_ref(),
+            &state.client,
+            &addr,
+            0,
+            to_ts,
         )
-    })?;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody {
+                    code: "SYNC_ERROR".into(),
+                    message: e,
+                }),
+            )
+        })?;
+    } else {
+        sync::sync_range(
+            &state.config,
+            path,
+            state.rate_limiter.as_ref(),
+            &state.client,
+            &addr,
+            from_ts,
+            to_ts,
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody {
+                    code: "SYNC_ERROR".into(),
+                    message: e,
+                }),
+            )
+        })?;
+    }
 
     let (rows, total) = db::list_activities(
-        &state.config.duckdb_path,
+        path,
         &addr,
         from_ts,
         to_ts,
@@ -138,16 +204,16 @@ async fn get_wallet_activity(
     let d: Vec<ActivityItemCompact> = rows
         .into_iter()
         .map(|r| ActivityItemCompact {
-                ts: r.ts,
-                type_: r.type_.clone(),
-                share: r.share,
-                price: r.price,
-                title: r.title,
-                outcome: r.outcome,
-                condition_id: r.condition_id,
-                token_id: r.token_id,
-                transaction_hash: r.transaction_hash,
-            })
+            ts: r.ts,
+            type_: r.type_,
+            share: r.share,
+            price: r.price,
+            title: r.title,
+            outcome: r.outcome,
+            condition_id: r.condition_id,
+            token_id: r.token_id,
+            transaction_hash: r.transaction_hash,
+        })
         .collect();
 
     let from_time = d.iter().map(|x| x.ts).min().and_then(|ts| {
@@ -165,173 +231,260 @@ async fn get_wallet_activity(
     }))
 }
 
-#[derive(Serialize)]
-pub struct WalletItem {
-    pub address: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_activity_ts: Option<i64>,
-}
-
-#[derive(Serialize)]
-pub struct WalletListResponse {
-    pub data: Vec<WalletItem>,
-}
-
-/// 每个地址的缓存条数
-#[derive(Serialize)]
-pub struct AddressRecordCount {
-    pub address: String,
-    pub record_count: u64,
-}
-
-#[derive(Serialize)]
-pub struct CacheByAddressResponse {
-    pub data: Vec<AddressRecordCount>,
-}
-
-/// 缓存概况响应：地址数、起止时间（可读）、数据条数
-#[derive(Serialize)]
-pub struct CacheSummaryResponse {
-    /// 已缓存的钱包地址数量
-    pub address_count: u64,
-    /// 缓存数据条数
-    pub record_count: u64,
-    /// 最早一条数据的时间（可读），无数据时为 null
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub time_start: Option<String>,
-    /// 最晚一条数据的时间（可读），无数据时为 null
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub time_end: Option<String>,
-}
-
-async fn get_cache_summary(
+/// POST /wallets/activity — 批量钱包历史交易；body.addresses 多个地址，同一 from_ts/to_ts；force_refresh 对所有地址生效
+async fn post_wallets_activity(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<CacheSummaryResponse>, (StatusCode, Json<ErrorBody>)> {
-    let summary = db::get_cache_summary(&state.config.duckdb_path).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                code: "DB_ERROR".into(),
-                message: e.to_string(),
-            }),
+    Json(body): Json<BatchActivityBody>,
+) -> Result<Json<BatchActivityResponse>, (StatusCode, Json<ErrorBody>)> {
+    let to_ts = body.to_ts.unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let path = &state.config.duckdb_path;
+    let mut out = Vec::with_capacity(body.addresses.len());
+    for address in &body.addresses {
+        let addr = address.trim().to_lowercase();
+        if addr.is_empty() || !addr.starts_with("0x") {
+            continue;
+        }
+        if body.force_refresh {
+            let _ = db::delete_activities_for_address(path, &addr);
+            if let Err(e) = sync::sync_range(
+                &state.config,
+                path,
+                state.rate_limiter.as_ref(),
+                &state.client,
+                &addr,
+                0,
+                to_ts,
+            )
+            .await
+            {
+                tracing::warn!(address = %addr, err = %e, "batch force_refresh sync failed");
+            }
+        } else if let Err(e) = sync::sync_range(
+            &state.config,
+            path,
+            state.rate_limiter.as_ref(),
+            &state.client,
+            &addr,
+            body.from_ts,
+            to_ts,
         )
-    })?;
-    let time_start = summary.min_ts.and_then(|ts| {
-        chrono::DateTime::from_timestamp(ts, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-    });
-    let time_end = summary.max_ts.and_then(|ts| {
-        chrono::DateTime::from_timestamp(ts, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-    });
-    Ok(Json(CacheSummaryResponse {
-        address_count: summary.address_count,
-        record_count: summary.record_count,
-        time_start,
-        time_end,
-    }))
-}
-
-async fn get_cache_by_address(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<CacheByAddressResponse>, (StatusCode, Json<ErrorBody>)> {
-    let rows = db::list_address_record_counts(&state.config.duckdb_path).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                code: "DB_ERROR".into(),
-                message: e.to_string(),
-            }),
+        .await
+        {
+            tracing::warn!(address = %addr, err = %e, "batch sync failed");
+        }
+        let (rows, total) = db::list_activities(
+            path,
+            &addr,
+            body.from_ts,
+            to_ts,
+            body.limit,
+            None,
         )
-    })?;
-    Ok(Json(CacheByAddressResponse {
-        data: rows
+        .unwrap_or((vec![], 0));
+        let d: Vec<ActivityItemCompact> = rows
             .into_iter()
-            .map(|(address, record_count)| AddressRecordCount {
-                address,
-                record_count,
+            .map(|r| ActivityItemCompact {
+                ts: r.ts,
+                type_: r.type_,
+                share: r.share,
+                price: r.price,
+                title: r.title,
+                outcome: r.outcome,
+                condition_id: r.condition_id,
+                token_id: r.token_id,
+                transaction_hash: r.transaction_hash,
             })
-            .collect(),
-    }))
+            .collect();
+        let from_time = d.iter().map(|x| x.ts).min().and_then(|ts| {
+            chrono::DateTime::from_timestamp(ts, 0).map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        });
+        let to_time = d.iter().map(|x| x.ts).max().and_then(|ts| {
+            chrono::DateTime::from_timestamp(ts, 0).map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        });
+        out.push(WalletActivityItem {
+            address: addr,
+            total,
+            from_time,
+            to_time,
+            data: d,
+        });
+    }
+    Ok(Json(BatchActivityResponse { data: out }))
 }
 
-async fn get_wallets(
+#[derive(Debug, Deserialize)]
+pub struct DailyStatsQuery {
+    pub wallet: Option<String>,
+    pub address: Option<String>,
+    pub from_date: String,
+    pub to_date: String,
+}
+
+#[derive(Serialize)]
+pub struct DailyStatsPoint {
+    pub date: String,
+    /// 当日交易额，仅统计买入金额
+    pub volume: f64,
+    /// 当日已实现利润，仅考虑卖出/兑付的赚亏（收入 − 对应成本）
+    pub profit: f64,
+}
+
+/// 单钱包的每日统计
+#[derive(Serialize)]
+pub struct WalletDailyStats {
+    pub wallet: String,
+    pub daily: Vec<DailyStatsPoint>,
+}
+
+#[derive(Serialize)]
+pub struct DailyStatsResponse {
+    /// 单钱包时仅一个元素；多钱包时按请求顺序返回
+    pub data: Vec<WalletDailyStats>,
+}
+
+/// GET /daily-stats — 指定钱包（可逗号分隔多个）、日期区间内每日交易额（仅 BUY）与已实现利润
+async fn get_daily_stats(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<WalletListResponse>, (StatusCode, Json<ErrorBody>)> {
-    let rows = db::list_wallets(&state.config.duckdb_path).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
+    Query(q): Query<DailyStatsQuery>,
+) -> Result<Json<DailyStatsResponse>, (StatusCode, Json<ErrorBody>)> {
+    let raw = q
+        .wallet
+        .or(q.address)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
             Json(ErrorBody {
-                code: "DB_ERROR".into(),
-                message: e.to_string(),
+                code: "BAD_REQUEST".into(),
+                message: "missing wallet or address".into(),
             }),
-        )
-    })?;
-    Ok(Json(WalletListResponse {
-        data: rows
-            .into_iter()
-            .map(|(a, ts)| WalletItem {
-                address: a,
-                latest_activity_ts: ts,
-            })
-            .collect(),
-    }))
-}
-
-#[derive(Deserialize)]
-pub struct RegisterWalletBody {
-    pub address: String,
-}
-
-async fn post_wallets(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<RegisterWalletBody>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let addr = body.address.to_lowercase();
-    if addr.is_empty() || !addr.starts_with("0x") {
+        ))?;
+    let addresses: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty() && s.starts_with("0x"))
+        .collect();
+    if addresses.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
                 code: "BAD_REQUEST".into(),
-                message: "invalid address".into(),
+                message: "invalid address(es)".into(),
             }),
         ));
     }
-    db::register_wallet(&state.config.duckdb_path, &addr).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorBody {
-                code: "DB_ERROR".into(),
-                message: e.to_string(),
-            }),
-        )
-    })?;
-    Ok(StatusCode::CREATED)
+
+    let path = &state.config.duckdb_path;
+    let from_ts = 0i64;
+    let to_ts = chrono::NaiveDate::parse_from_str(q.to_date.trim(), "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(23, 59, 59))
+        .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let from_date = q.from_date.trim().to_string();
+    let to_date = q.to_date.trim().to_string();
+
+    let mut data = Vec::with_capacity(addresses.len());
+    for addr in addresses {
+        let activities = db::list_activities_in_range(path, &addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
+        let daily = valuation::compute_daily_volume_and_realized_pnl(&activities, &from_date, &to_date);
+        let daily_points: Vec<DailyStatsPoint> = daily
+            .into_iter()
+            .map(|(date, volume, profit)| DailyStatsPoint {
+                date,
+                volume,
+                profit,
+            })
+            .collect();
+        data.push(WalletDailyStats {
+            wallet: addr,
+            daily: daily_points,
+        });
+    }
+    Ok(Json(DailyStatsResponse { data }))
 }
 
-/// GET /llms.txt — llms.txt 规范：面向 LLM 的本服务调用说明（Markdown）
+#[derive(Debug, Deserialize)]
+pub struct BatchDailyStatsBody {
+    pub wallets: Vec<String>,
+    pub from_date: String,
+    pub to_date: String,
+}
+
+/// POST /daily-stats — 批量钱包聚合数据（每日交易额与已实现利润），Body: wallets、from_date、to_date
+async fn post_daily_stats(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BatchDailyStatsBody>,
+) -> Result<Json<DailyStatsResponse>, (StatusCode, Json<ErrorBody>)> {
+    let addresses: Vec<String> = body
+        .wallets
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty() && s.starts_with("0x"))
+        .collect();
+    if addresses.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                code: "BAD_REQUEST".into(),
+                message: "wallets required and must be valid 0x addresses".into(),
+            }),
+        ));
+    }
+
+    let path = &state.config.duckdb_path;
+    let from_ts = 0i64;
+    let to_ts = chrono::NaiveDate::parse_from_str(body.to_date.trim(), "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(23, 59, 59))
+        .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let from_date = body.from_date.trim().to_string();
+    let to_date = body.to_date.trim().to_string();
+
+    let mut data = Vec::with_capacity(addresses.len());
+    for addr in addresses {
+        let activities = db::list_activities_in_range(path, &addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
+        let daily = valuation::compute_daily_volume_and_realized_pnl(&activities, &from_date, &to_date);
+        let daily_points: Vec<DailyStatsPoint> = daily
+            .into_iter()
+            .map(|(date, volume, profit)| DailyStatsPoint {
+                date,
+                volume,
+                profit,
+            })
+            .collect();
+        data.push(WalletDailyStats {
+            wallet: addr,
+            daily: daily_points,
+        });
+    }
+    Ok(Json(DailyStatsResponse { data }))
+}
+
+/// GET /llms.txt — 面向 LLM 的本服务说明（Markdown）
 async fn get_llms_txt() -> Response {
-    let base = ""; // 相对路径，适用于任意 host/port
+    let base = "";
     let body = format!(
-        r#"## API 端点
+        r#"## poly_activity API
 
-- [缓存概览]({base}/cache/summary): GET。返回缓存统计：地址数、记录数、时间范围（time_start/time_end）。
-- [按地址缓存]({base}/cache/by-address): GET。各钱包地址及其记录条数。
-- [钱包列表]({base}/wallets): GET。已缓存钱包列表及每地址最新活动时间戳。
-- [注册钱包]({base}/wallets): POST。Body JSON: `{{"address":"0x..."}}`。将地址纳入缓存（后续活动查询时会按需同步）。
-- [钱包活动]({base}/wallets/{{address}}/activity): GET。按时间区间查询某地址的 Polymarket 活动。查询参数：`from_ts`（必填，Unix 秒）、`to_ts`（可选，默认当前时间）、`limit`（可选，默认 50000）、`type`（可选，活动类型过滤）。返回紧凑 JSON：`total`、`from_time`/`to_time`、`data`（ts, type, share, price, title, outcome, condition_id, token_id, transaction_hash 等）。
+Polymarket 钱包活动缓存后端，仅两个接口。
 
-## 使用说明
+### 1. 历史交易
 
-本服务为 Polymarket 钱包活动缓存后端，按查询触发与 Polymarket API 的同步，数据落 DuckDB。所有接口返回 JSON；时间戳均为 Unix 秒。活动接口首次查询某地址某时间区间时会自动拉取并写入缓存再返回。
+- **GET** `{base}/wallets/{{address}}/activity`
+- Query: `from_ts`（必填）、`to_ts`、`limit`、`type`、`force_refresh`（可选，true 时清空该钱包本地数据并从 Polymarket 重拉）
+- 返回: `total`、`from_time`/`to_time`、`data`（ts, type, share, price, title, outcome, condition_id, token_id, transaction_hash 等）
 
-> Polymarket 钱包活动缓存服务，提供按时间区间的活动查询与缓存概览。
+### 2. 每日交易额与利润（聚合）
 
-# poly_activity
+- **GET** `{base}/daily-stats` — Query: `wallet` 或 `address`（可逗号分隔）、`from_date`、`to_date`
+- **POST** `{base}/daily-stats` — Body: `{{ "wallets": ["0x...", "0x..."], "from_date": "2025-01-01", "to_date": "2025-01-31" }}`
+- 返回: `data`: [{{ wallet, daily: [{{ date, volume（仅买入）, profit（仅卖出赚亏） }}] }}]
+
+基地址示例: http://localhost:7001
 "#
     );
     Response::builder()
-        .status(StatusCode::OK)
+        .status(200)
         .header(header::CONTENT_TYPE, "text/markdown; charset=utf-8")
         .body(Body::from(body))
         .unwrap()
@@ -340,12 +493,10 @@ async fn get_llms_txt() -> Response {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/llms.txt", axum::routing::get(get_llms_txt))
-        .route("/cache/summary", axum::routing::get(get_cache_summary))
-        .route("/cache/by-address", axum::routing::get(get_cache_by_address))
-        .route("/wallets", axum::routing::get(get_wallets).post(post_wallets))
         .route(
             "/wallets/:address/activity",
             axum::routing::get(get_wallet_activity),
         )
+        .route("/daily-stats", axum::routing::get(get_daily_stats).post(post_daily_stats))
         .with_state(state)
 }

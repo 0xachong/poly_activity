@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>仪表盘 - poly_activity</title>
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --card: #1a1a1e;
+      --text: #e4e4e7;
+      --text-muted: #a1a1aa;
+      --green: #22c55e;
+      --red: #ef4444;
+      --border: #27272a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 1.5rem;
+    }
+    .api-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 1.5rem;
+    }
+    .api-bar label { color: var(--text-muted); font-size: 0.875rem; }
+    .api-bar input {
+      width: 280px;
+      padding: 0.5rem 0.75rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+    }
+    .api-bar button {
+      padding: 0.5rem 1rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      cursor: pointer;
+    }
+    .api-bar button:hover { background: #27272a; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+    @media (max-width: 900px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 500px) { .cards { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+    }
+    .card .label { color: var(--text-muted); font-size: 0.8rem; margin-bottom: 0.25rem; }
+    .card .value { font-size: 1.5rem; font-weight: 600; }
+    .card .sub { color: var(--text-muted); font-size: 0.75rem; margin-top: 0.35rem; }
+    .card .value.positive { color: var(--green); }
+    .card .value.negative { color: var(--red); }
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1rem;
+    }
+    .section-title h2 { margin: 0; font-size: 1.1rem; font-weight: 600; }
+    .range-btns { display: flex; gap: 0.25rem; }
+    .range-btns button {
+      padding: 0.35rem 0.75rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      cursor: pointer;
+    }
+    .range-btns button:hover { color: var(--text); }
+    .range-btns button.active { background: #27272a; color: var(--text); }
+    .chart-wrap {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+      margin-bottom: 2rem;
+      min-height: 280px;
+    }
+    #chartCanvas { width: 100%; height: 260px; display: block; }
+    .accounts-section .section-title .sub { color: var(--text-muted); font-size: 0.8rem; font-weight: normal; }
+    .account-group { margin-bottom: 1.5rem; }
+    .account-group-title { font-size: 0.85rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0.5rem; text-transform: capitalize; }
+    .accounts-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 1rem;
+    }
+    .account-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+    }
+    .account-card .id { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.75rem; word-break: break-all; }
+    .account-card .row { display: flex; justify-content: space-between; margin-top: 0.5rem; font-size: 0.9rem; }
+    .account-card .row .k { color: var(--text-muted); }
+    .error-msg { color: var(--red); font-size: 0.9rem; padding: 0.5rem 0; }
+    .loading { color: var(--text-muted); }
+  </style>
+</head>
+<body>
+  <div class="api-bar">
+    <label for="apiBase">API 地址</label>
+    <input id="apiBase" type="text" placeholder="http://localhost:7001" />
+    <button type="button" id="saveApi">保存</button>
+    <button type="button" id="loadBtn">加载数据</button>
+    <button type="button" id="syncRunBtn">拉取数据（同步链上活动）</button>
+    <a href="account-manage.html" style="margin-left:0.5rem;color:var(--text-muted);font-size:0.9rem;">账户管理</a>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">总资产 (Total Assets)</div>
+      <div class="value" id="totalAssets">--</div>
+      <div class="sub">总余额</div>
+    </div>
+    <div class="card">
+      <div class="label">总盈亏 (Total P/L)</div>
+      <div class="value" id="totalPnl">--</div>
+      <div class="sub">历史累计</div>
+    </div>
+    <div class="card">
+      <div class="label">今日盈亏 (Today's P/L)</div>
+      <div class="value" id="todayPnl">--</div>
+      <div class="sub" id="todayVolume">成交量: --</div>
+    </div>
+    <div class="card">
+      <div class="label">月回报率 (Monthly Return Rate)</div>
+      <div class="value" id="monthlyReturn">--</div>
+      <div class="sub" id="maxDrawdown">Max Drawdown: --</div>
+    </div>
+  </div>
+
+  <div class="chart-wrap">
+    <div class="section-title">
+      <h2>净值走势</h2>
+      <div class="range-btns">
+        <button type="button" data-range="1w">1W</button>
+        <button type="button" data-range="1m" class="active">1M</button>
+        <button type="button" data-range="all">ALL</button>
+      </div>
+    </div>
+    <canvas id="chartCanvas"></canvas>
+    <div id="chartError" class="error-msg" style="display:none;"></div>
+  </div>
+
+  <div class="accounts-section">
+    <div class="section-title">
+      <h2>Detailed Account Breakdown</h2>
+      <span class="sub" id="accountCount">0 Active Accounts</span>
+    </div>
+    <div id="accountsError" class="error-msg" style="display:none;"></div>
+    <p class="loading" id="syncHint" style="font-size:0.8rem; margin-bottom:0.5rem;">无数据时请先在「账户管理」页执行「同步全部」拉取链上活动。</p>
+    <div id="accountsGrid"></div>
+  </div>
+
+  <script>
+    const STORAGE_KEY = 'poly_activity_api_base';
+    const defaultBase = 'http://localhost:7001';
+
+    function getBase() {
+      const el = document.getElementById('apiBase');
+      const v = (el && el.value.trim()) || localStorage.getItem(STORAGE_KEY) || defaultBase;
+      return v.replace(/\/$/, '');
+    }
+
+    function setBase(v) {
+      const el = document.getElementById('apiBase');
+      if (el) el.value = v || defaultBase;
+    }
+
+    function fmtMoney(n) {
+      if (n == null || Number.isNaN(n)) return '--';
+      return Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+
+    function fmtPct(n) {
+      if (n == null || Number.isNaN(n)) return '--';
+      return (Number(n) * 100).toFixed(2) + '%';
+    }
+
+    function applySign(el, value, isPct) {
+      if (el) {
+        const num = Number(value);
+        el.textContent = isPct ? fmtPct(num) : ('$' + fmtMoney(num));
+        el.classList.remove('positive', 'negative');
+        if (!Number.isNaN(num) && num > 0) el.classList.add('positive');
+        if (!Number.isNaN(num) && num < 0) el.classList.add('negative');
+      }
+    }
+
+    async function fetchJson(path) {
+      const base = getBase();
+      const res = await fetch(base + path);
+      if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+      return res.json();
+    }
+
+    async function loadSummary() {
+      const ids = ['totalAssets', 'totalPnl', 'todayPnl', 'monthlyReturn'];
+      ids.forEach(id => { const el = document.getElementById(id); if (el) el.textContent = '...'; });
+      try {
+        const d = await fetchJson('/dashboard/summary');
+        const totalAssets = document.getElementById('totalAssets');
+        const totalPnl = document.getElementById('totalPnl');
+        const todayPnl = document.getElementById('todayPnl');
+        const todayVolume = document.getElementById('todayVolume');
+        const monthlyReturn = document.getElementById('monthlyReturn');
+        const maxDrawdown = document.getElementById('maxDrawdown');
+        if (totalAssets) totalAssets.textContent = '$' + fmtMoney(d.total_assets);
+        applySign(totalPnl, d.total_pnl, false);
+        applySign(todayPnl, d.today_pnl, false);
+        if (todayVolume) todayVolume.textContent = '成交量: $' + fmtMoney(d.today_volume);
+        applySign(monthlyReturn, d.monthly_return_rate, true);
+        if (maxDrawdown) maxDrawdown.textContent = 'Max Drawdown: ' + fmtPct(d.max_drawdown);
+      } catch (e) {
+        document.getElementById('totalAssets').textContent = 'Error';
+        document.getElementById('totalPnl').textContent = e.message || 'Failed';
+      }
+    }
+
+    let chartRange = '1m';
+    function drawChart(data) {
+      const canvas = document.getElementById('chartCanvas');
+      const errEl = document.getElementById('chartError');
+      if (!canvas || !data || !data.data || data.data.length === 0) {
+        if (errEl) { errEl.style.display = 'block'; errEl.textContent = '暂无数据'; }
+        return;
+      }
+      if (errEl) errEl.style.display = 'none';
+      const ctx = canvas.getContext('2d');
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.scale(dpr, dpr);
+      const W = rect.width;
+      const H = rect.height;
+      const padding = { top: 20, right: 20, bottom: 28, left: 52 };
+      const plotW = W - padding.left - padding.right;
+      const plotH = H - padding.top - padding.bottom;
+      const vals = data.data.map(x => x.net_value);
+      const minV = Math.min(...vals);
+      const maxV = Math.max(...vals);
+      const range = maxV - minV || 1;
+      const scaleMin = minV - range * 0.05;
+      const scaleMax = maxV + range * 0.05;
+      const scaleRange = scaleMax - scaleMin || 1;
+      const n = data.data.length;
+      const step = n > 1 ? plotW / (n - 1) : 0;
+
+      ctx.fillStyle = '#1a1a1e';
+      ctx.fillRect(0, 0, W, H);
+      ctx.strokeStyle = '#27272a';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(padding.left, padding.top);
+      ctx.lineTo(padding.left, padding.top + plotH);
+      ctx.lineTo(padding.left + plotW, padding.top + plotH);
+      ctx.stroke();
+      ctx.fillStyle = '#a1a1aa';
+      ctx.font = '11px system-ui';
+      ctx.textAlign = 'right';
+      for (let i = 0; i <= 4; i++) {
+        const v = scaleMin + (scaleRange * (1 - i / 4));
+        const y = padding.top + (i / 4) * plotH;
+        ctx.fillText('$' + (v >= 1000 ? (v/1000).toFixed(0) + 'k' : v.toFixed(0)), padding.left - 8, y + 4);
+      }
+      ctx.textAlign = 'center';
+      const slice = n <= 8 ? data.data : data.data.filter((_, i) => i % Math.ceil(n / 8) === 0);
+      slice.forEach((pt, i) => {
+        const idx = data.data.indexOf(pt);
+        const x = padding.left + idx * step;
+        ctx.fillText(pt.date.slice(5), x, padding.top + plotH + 18);
+      });
+
+      ctx.strokeStyle = '#22c55e';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      data.data.forEach((pt, i) => {
+        const x = padding.left + i * step;
+        const y = padding.top + plotH - ((pt.net_value - scaleMin) / scaleRange) * plotH;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    async function loadNetValue(range) {
+      chartRange = range || chartRange;
+      try {
+        const d = await fetchJson('/dashboard/net-value?range=' + encodeURIComponent(chartRange));
+        drawChart(d);
+      } catch (e) {
+        document.getElementById('chartError').style.display = 'block';
+        document.getElementById('chartError').textContent = e.message || '加载失败';
+      }
+    }
+
+    function getGroupKey(displayName) {
+      const name = (displayName || '').trim();
+      const m = name.match(/^([a-zA-Z]+)/);
+      return m ? m[1].toLowerCase() : 'other';
+    }
+
+    async function loadAccounts() {
+      const container = document.getElementById('accountsGrid');
+      const errEl = document.getElementById('accountsError');
+      const countEl = document.getElementById('accountCount');
+      if (container) container.innerHTML = '';
+      if (errEl) errEl.style.display = 'none';
+      try {
+        const d = await fetchJson('/dashboard/accounts');
+        const list = d.data || [];
+        if (countEl) countEl.textContent = list.length + ' Active Accounts';
+        if (list.length === 0) {
+          container.innerHTML = '<p class="loading">暂无账户。请先通过 POST /accounts 或「账户管理」Batch Import 登记账户。</p>';
+          return;
+        }
+        const byGroup = {};
+        list.forEach(acc => {
+          const key = getGroupKey(acc.display_name || acc.account_id);
+          if (!byGroup[key]) byGroup[key] = [];
+          byGroup[key].push(acc);
+        });
+        const groupKeys = Object.keys(byGroup).sort();
+        groupKeys.forEach(key => {
+          const accs = byGroup[key].sort((a, b) => (a.display_name || a.account_id || '').localeCompare(b.display_name || b.account_id || ''));
+          const section = document.createElement('div');
+          section.className = 'account-group';
+          section.innerHTML = '<div class="account-group-title">' + key + '</div><div class="accounts-grid"></div>';
+          const grid = section.querySelector('.accounts-grid');
+          accs.forEach(acc => {
+            const card = document.createElement('a');
+            card.className = 'account-card';
+            card.href = 'account-detail.html?account_id=' + encodeURIComponent(acc.account_id || '') +
+              '&display_name=' + encodeURIComponent(acc.display_name || '') +
+              '&wallet_address=' + encodeURIComponent(acc.wallet_address || '');
+            card.style.textDecoration = 'none';
+            card.style.color = 'inherit';
+            const name = acc.display_name || acc.account_id || acc.wallet_address || '';
+            const id = (acc.account_id || acc.wallet_address || '');
+            const showId = name !== id ? id : '';
+            card.innerHTML =
+              '<div class="id">' + name + (showId ? '<br><span style="font-size:0.75rem;opacity:0.8">' + showId + '</span>' : '') + '</div>' +
+              '<div class="row"><span class="k">TOTAL VALUE</span><span>' + (acc.total_value != null ? ('$' + fmtMoney(acc.total_value)) : '—') + '</span></div>' +
+              '<div class="row"><span class="k">TOTAL PNL</span><span class="pnl">' + (acc.total_pnl != null ? ('$' + fmtMoney(acc.total_pnl)) : '—') + '</span></div>' +
+              '<div class="row"><span class="k">MONTHLY ROI</span><span class="roi">' + fmtPct(acc.monthly_roi) + '</span></div>';
+            const pnlEl = card.querySelector('.pnl');
+            const roiEl = card.querySelector('.roi');
+            if (Number(acc.total_pnl) > 0) pnlEl.classList.add('positive'); else if (Number(acc.total_pnl) < 0) pnlEl.classList.add('negative');
+            if (Number(acc.monthly_roi) > 0) roiEl.classList.add('positive'); else if (Number(acc.monthly_roi) < 0) roiEl.classList.add('negative');
+            grid.appendChild(card);
+          });
+          container.appendChild(section);
+        });
+      } catch (e) {
+        if (errEl) { errEl.style.display = 'block'; errEl.textContent = e.message || '加载失败'; }
+        if (countEl) countEl.textContent = '0 Active Accounts';
+      }
+    }
+
+    async function loadAll() {
+      await Promise.all([loadSummary(), loadNetValue(chartRange), loadAccounts()]);
+    }
+
+    document.getElementById('saveApi').addEventListener('click', () => {
+      const v = document.getElementById('apiBase').value.trim();
+      localStorage.setItem(STORAGE_KEY, v || defaultBase);
+    });
+    document.getElementById('loadBtn').addEventListener('click', loadAll);
+    document.getElementById('syncRunBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('syncRunBtn');
+      const orig = btn.textContent;
+      const url = getBase() + '/sync/run';
+      console.log('[拉取数据] 开始请求', url);
+      btn.disabled = true;
+      btn.textContent = '拉取中…';
+      try {
+        const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        console.log('[拉取数据] 响应', res.status, res.statusText);
+        const data = await res.json().catch(() => ({}));
+        console.log('[拉取数据] 响应体', data);
+        btn.textContent = orig;
+        if (!res.ok) throw new Error(data.message || res.statusText || '拉取失败');
+        console.log('[拉取数据] 成功 账户数=', data.synced_count, '新增活动=', data.total_activities_added);
+        alert('已同步 ' + (data.synced_count || 0) + ' 个账户，新增 ' + (data.total_activities_added || 0) + ' 条活动。');
+        console.log('[拉取数据] 刷新仪表盘…');
+        loadAll();
+      } catch (e) {
+        console.warn('[拉取数据] 失败', e);
+        btn.textContent = orig;
+        alert(e.message || '拉取失败');
+      } finally {
+        btn.disabled = false;
+        console.log('[拉取数据] 结束');
+      }
+    });
+    document.querySelectorAll('.range-btns button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.range-btns button').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        loadNetValue(btn.dataset.range);
+      });
+    });
+
+    setBase(localStorage.getItem(STORAGE_KEY) || defaultBase);
+    loadAll();
+  </script>
+</body>
+</html>

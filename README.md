@@ -25,6 +25,8 @@ cargo build --release   # 首次构建含 DuckDB bundled 会较慢
 
 ## HTTP API
 
+完整接口列表见 **[docs/API.md](docs/API.md)**。以下为常用入口摘要。
+
 ### 按时间区间查某地址 Activity（主入口，会先触发同步）
 
 ```http
