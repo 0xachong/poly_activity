@@ -464,12 +464,12 @@ async fn post_wallets_activity(
         let db_write_lock = state.db_write_lock.clone();
         tokio::spawn(async move {
             let mut out = Vec::with_capacity(addresses.len());
+            // 整个写库阶段持有一把锁，避免与其它请求的写操作交错导致 DuckDB Invalid bitmask
+            let _guard = db_write_lock.lock().await;
             for (i, addr) in addresses.iter().enumerate() {
-                {
-                    let _guard = db_write_lock.lock().await;
-                    if force_refresh {
-                        let _ = db::delete_activities_for_address(&path, addr);
-                        if let Err(e) = sync::sync_range(
+                if force_refresh {
+                    let _ = db::delete_activities_for_address(&path, addr);
+                    if let Err(e) = sync::sync_range(
                         &config,
                         &path,
                         rate_limiter.as_ref(),
@@ -500,7 +500,6 @@ async fn post_wallets_activity(
                     j.status = JobStatus::Failed;
                     j.error = Some(e);
                     return;
-                }
                 }
                 let mut j = job_ref.write().await;
                 j.completed = i + 1;
@@ -775,9 +774,10 @@ async fn get_daily_stats(
         tokio::spawn(async move {
             let sync_to_ts = end_of_yesterday_ts();
             let from_ts = 0i64;
-            for (i, addr) in addrs.iter().enumerate() {
-                {
-                    let _guard = db_write_lock.lock().await;
+            // 整个写库阶段持有一把锁，避免与其它请求的写操作交错导致 DuckDB Invalid bitmask
+            {
+                let _guard = db_write_lock.lock().await;
+                for (i, addr) in addrs.iter().enumerate() {
                     if let Err(e) = sync::sync_range(
                         &config,
                         &path,
@@ -794,10 +794,10 @@ async fn get_daily_stats(
                         j.error = Some(e);
                         return;
                     }
+                    let mut j = job_ref.write().await;
+                    j.completed = i + 1;
+                    j.status = JobStatus::Running;
                 }
-                let mut j = job_ref.write().await;
-                j.completed = i + 1;
-                j.status = JobStatus::Running;
             }
             let mut data = Vec::with_capacity(addrs.len());
             for addr in &addrs {
@@ -952,9 +952,10 @@ async fn post_daily_stats(
         let db_write_lock = state.db_write_lock.clone();
         tokio::spawn(async move {
             let sync_to_ts = end_of_yesterday_ts();
-            for (i, addr) in addresses.iter().enumerate() {
-                {
-                    let _guard = db_write_lock.lock().await;
+            // 整个写库阶段持有一把锁，避免与其它请求的写操作交错导致 DuckDB Invalid bitmask
+            {
+                let _guard = db_write_lock.lock().await;
+                for (i, addr) in addresses.iter().enumerate() {
                     if let Err(e) = sync::sync_range(
                         &config,
                         &path,
@@ -971,10 +972,10 @@ async fn post_daily_stats(
                         j.error = Some(e);
                         return;
                     }
+                    let mut j = job_ref.write().await;
+                    j.completed = i + 1;
+                    j.status = JobStatus::Running;
                 }
-                let mut j = job_ref.write().await;
-                j.completed = i + 1;
-                j.status = JobStatus::Running;
             }
             let mut data = Vec::with_capacity(addresses.len());
             for addr in &addresses {
