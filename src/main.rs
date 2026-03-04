@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limiter,
         client,
         jobs: Arc::new(RwLock::new(HashMap::new())),
+        db_write_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
     let app = router(state).layer(

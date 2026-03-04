@@ -52,6 +52,8 @@ pub struct AppState {
     pub client: Client,
     /// 批量任务：job_id -> 任务状态（超过 max_batch_addresses 时创建）
     pub jobs: Arc<RwLock<HashMap<String, Arc<RwLock<JobState>>>>>,
+    /// DuckDB 单写：所有写库（sync、recompute）串行化，避免并发写导致 Invalid bitmask for FixedSizeAllocator
+    pub db_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,6 +300,7 @@ async fn get_wallet_activity(
             )
         })?;
         tracing::info!(address = %addr, deleted = n, "force_refresh: cleared activities");
+        let _guard = state.db_write_lock.lock().await;
         sync::sync_range(
             &state.config,
             path,
@@ -318,6 +321,7 @@ async fn get_wallet_activity(
             )
         })?;
     } else {
+        let _guard = state.db_write_lock.lock().await;
         sync::sync_range(
             &state.config,
             path,
@@ -457,12 +461,15 @@ async fn post_wallets_activity(
         let to_ts = body.to_ts.unwrap_or_else(|| chrono::Utc::now().timestamp());
         let limit = body.limit;
         let force_refresh = body.force_refresh;
+        let db_write_lock = state.db_write_lock.clone();
         tokio::spawn(async move {
             let mut out = Vec::with_capacity(addresses.len());
             for (i, addr) in addresses.iter().enumerate() {
-                if force_refresh {
-                    let _ = db::delete_activities_for_address(&path, addr);
-                    if let Err(e) = sync::sync_range(
+                {
+                    let _guard = db_write_lock.lock().await;
+                    if force_refresh {
+                        let _ = db::delete_activities_for_address(&path, addr);
+                        if let Err(e) = sync::sync_range(
                         &config,
                         &path,
                         rate_limiter.as_ref(),
@@ -493,6 +500,7 @@ async fn post_wallets_activity(
                     j.status = JobStatus::Failed;
                     j.error = Some(e);
                     return;
+                }
                 }
                 let mut j = job_ref.write().await;
                 j.completed = i + 1;
@@ -581,6 +589,7 @@ async fn post_wallets_activity(
         if addr.is_empty() || !addr.starts_with("0x") {
             continue;
         }
+        let _guard = state.db_write_lock.lock().await;
         if body.force_refresh {
             let _ = db::delete_activities_for_address(path, &addr);
             if let Err(e) = sync::sync_range(
@@ -762,25 +771,29 @@ async fn get_daily_stats(
         let rate_limiter = state.rate_limiter.clone();
         let client = state.client.clone();
         let addrs = addresses.clone();
+        let db_write_lock = state.db_write_lock.clone();
         tokio::spawn(async move {
             let sync_to_ts = end_of_yesterday_ts();
             let from_ts = 0i64;
             for (i, addr) in addrs.iter().enumerate() {
-                if let Err(e) = sync::sync_range(
-                    &config,
-                    &path,
-                    rate_limiter.as_ref(),
-                    &client,
-                    addr,
-                    0,
-                    sync_to_ts,
-                )
-                .await
                 {
-                    let mut j = job_ref.write().await;
-                    j.status = JobStatus::Failed;
-                    j.error = Some(e);
-                    return;
+                    let _guard = db_write_lock.lock().await;
+                    if let Err(e) = sync::sync_range(
+                        &config,
+                        &path,
+                        rate_limiter.as_ref(),
+                        &client,
+                        addr,
+                        0,
+                        sync_to_ts,
+                    )
+                    .await
+                    {
+                        let mut j = job_ref.write().await;
+                        j.status = JobStatus::Failed;
+                        j.error = Some(e);
+                        return;
+                    }
                 }
                 let mut j = job_ref.write().await;
                 j.completed = i + 1;
@@ -832,8 +845,9 @@ async fn get_daily_stats(
         .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-    // 先按「截止到前一天」同步基础数据，再读库算统计；避免每次请求都拉当天数据，每天触发一次即可
+    // 先按「截止到前一天」同步基础数据，再读库算统计；写库串行化避免 DuckDB 并发写错误
     let sync_to_ts = end_of_yesterday_ts();
+    let _guard = state.db_write_lock.lock().await;
     for addr in &addresses {
         if let Err(e) = sync::sync_range(
             &state.config,
@@ -935,24 +949,28 @@ async fn post_daily_stats(
         let config = state.config.clone();
         let rate_limiter = state.rate_limiter.clone();
         let client = state.client.clone();
+        let db_write_lock = state.db_write_lock.clone();
         tokio::spawn(async move {
             let sync_to_ts = end_of_yesterday_ts();
             for (i, addr) in addresses.iter().enumerate() {
-                if let Err(e) = sync::sync_range(
-                    &config,
-                    &path,
-                    rate_limiter.as_ref(),
-                    &client,
-                    addr,
-                    0,
-                    sync_to_ts,
-                )
-                .await
                 {
-                    let mut j = job_ref.write().await;
-                    j.status = JobStatus::Failed;
-                    j.error = Some(e);
-                    return;
+                    let _guard = db_write_lock.lock().await;
+                    if let Err(e) = sync::sync_range(
+                        &config,
+                        &path,
+                        rate_limiter.as_ref(),
+                        &client,
+                        addr,
+                        0,
+                        sync_to_ts,
+                    )
+                    .await
+                    {
+                        let mut j = job_ref.write().await;
+                        j.status = JobStatus::Failed;
+                        j.error = Some(e);
+                        return;
+                    }
                 }
                 let mut j = job_ref.write().await;
                 j.completed = i + 1;
@@ -998,6 +1016,7 @@ async fn post_daily_stats(
 
     let path = &state.config.duckdb_path;
     let sync_to_ts = end_of_yesterday_ts();
+    let _guard = state.db_write_lock.lock().await;
     for addr in &addresses {
         if let Err(e) = sync::sync_range(
             &state.config,
