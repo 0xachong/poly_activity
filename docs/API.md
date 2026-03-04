@@ -24,8 +24,8 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/daily-stats` | 单钱包或逗号分隔多钱包。Query：`wallet` 或 `address`（必填，可 `0x1,0x2`）、`from_date`、`to_date`。返回 `data`: [{ `wallet`, `daily`: [{ `date`, `volume`, `profit` }] }] |
-| POST | `/daily-stats` | **批量钱包**。Body: `{ "wallets": ["0x...", "0x..."], "from_date": "2025-01-01", "to_date": "2025-01-31" }`。返回同 GET：`data` 按钱包顺序，每项含 `wallet`、`daily`（每日 `volume` 仅买入、`profit` 仅卖出赚亏） |
+| GET | `/daily-stats` | 单钱包或逗号分隔多钱包。Query：`wallet` 或 `address`（必填，可 `0x1,0x2`）、`from_date`、`to_date`。返回 `data`: [{ `wallet`, `daily`: [{ `date`, `volume`, `profit` }] }]。**调用时会先按「截止到前一天」同步该地址基础数据，再读库算统计，避免每次请求都拉当天数据。** |
+| POST | `/daily-stats` | **批量钱包**。Body: `{ "wallets": ["0x...", "0x..."], "from_date": "2025-01-01", "to_date": "2025-01-31" }`。返回同 GET。**同样会先对每个钱包同步截止到前一天的基础数据。** |
 
 ---
 

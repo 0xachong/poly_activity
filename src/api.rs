@@ -40,6 +40,13 @@ fn default_limit() -> u32 {
     50_000
 }
 
+/// 昨日 23:59:59 UTC 的 Unix 时间戳。统计接口同步基础数据只拉到此时间，避免每次请求都拉当天数据。
+fn end_of_yesterday_ts() -> i64 {
+    let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).date_naive();
+    let end = yesterday.and_hms_opt(23, 59, 59).unwrap();
+    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end, chrono::Utc).timestamp()
+}
+
 /// REDEEM 展示用：按历史持仓算出的有效份额。key = (ts, tx_hash, condition_id, token_id)
 /// 性能：会拉取该地址 [min_ts, to_ts] 的全量活动（一次 list_activities_in_range），仅当本页含 REDEEM 时才调用。
 fn effective_redeem_share_map(
@@ -526,6 +533,31 @@ async fn get_daily_stats(
     let from_date = q.from_date.trim().to_string();
     let to_date = q.to_date.trim().to_string();
 
+    // 先按「截止到前一天」同步基础数据，再读库算统计；避免每次请求都拉当天数据，每天触发一次即可
+    let sync_to_ts = end_of_yesterday_ts();
+    for addr in &addresses {
+        if let Err(e) = sync::sync_range(
+            &state.config,
+            path,
+            state.rate_limiter.as_ref(),
+            &state.client,
+            addr,
+            0,
+            sync_to_ts,
+        )
+        .await
+        {
+            tracing::warn!(address = %addr, err = %e, "daily-stats: sync up to yesterday failed");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody {
+                    code: "SYNC_ERROR".into(),
+                    message: e,
+                }),
+            ));
+        }
+    }
+
     let mut data = Vec::with_capacity(addresses.len());
     for addr in addresses {
         let activities = db::list_activities_in_range(path, &addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
@@ -583,6 +615,31 @@ async fn post_daily_stats(
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
     let from_date = body.from_date.trim().to_string();
     let to_date = body.to_date.trim().to_string();
+
+    // 先按「截止到前一天」同步基础数据，再读库算统计
+    let sync_to_ts = end_of_yesterday_ts();
+    for addr in &addresses {
+        if let Err(e) = sync::sync_range(
+            &state.config,
+            path,
+            state.rate_limiter.as_ref(),
+            &state.client,
+            addr,
+            0,
+            sync_to_ts,
+        )
+        .await
+        {
+            tracing::warn!(address = %addr, err = %e, "daily-stats POST: sync up to yesterday failed");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody {
+                    code: "SYNC_ERROR".into(),
+                    message: e,
+                }),
+            ));
+        }
+    }
 
     let mut data = Vec::with_capacity(addresses.len());
     for addr in addresses {
