@@ -373,6 +373,20 @@ fn page_has_redeem(rows: &[db::ActivityRow]) -> bool {
     rows.iter().any(|r| r.type_.eq_ignore_ascii_case("REDEEM"))
 }
 
+/// 构造 503 响应并带上 Retry-After，便于客户端重试（写 worker 不可用或异常时）
+fn response_503_retry(code: &str, message: &str, retry_secs: u32) -> Response {
+    let body = Json(ErrorBody {
+        code: code.to_string(),
+        message: message.to_string(),
+    });
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, retry_secs.to_string())],
+        body,
+    )
+        .into_response()
+}
+
 #[derive(Serialize)]
 pub struct ActivityItemCompact {
     pub ts: i64,
@@ -904,7 +918,7 @@ async fn get_daily_stats(
         let job_ref = Arc::new(RwLock::new(job_state));
         state.jobs.write().await.insert(job_id.clone(), job_ref.clone());
 
-        state
+        if state
             .write_job_tx
             .send(WriteJob::BatchDailyStats {
                 job_id: job_id.clone(),
@@ -913,15 +927,14 @@ async fn get_daily_stats(
                 to_date: to_date.clone(),
             })
             .await
-            .map_err(|_| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorBody {
-                        code: "QUEUE_FULL".into(),
-                        message: "write worker unavailable".into(),
-                    }),
-                )
-            })?;
+            .is_err()
+        {
+            return Ok(response_503_retry(
+                "WORKER_UNAVAILABLE",
+                "write worker unavailable, please retry after a few seconds",
+                5,
+            ));
+        }
 
         return Ok((
             StatusCode::ACCEPTED,
@@ -943,40 +956,40 @@ async fn get_daily_stats(
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
     let (tx, rx) = oneshot::channel();
-    state
+    if state
         .write_job_tx
         .send(WriteJob::SyncManyUntilYesterday {
             items: addresses.clone(),
             respond: tx,
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorBody {
-                    code: "QUEUE_FULL".into(),
-                    message: "write worker unavailable".into(),
-                }),
-            )
-        })?;
-    let sync_ok = rx.await.map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorBody {
-                code: "SYNC_ERROR".into(),
-                message: "write worker dropped".into(),
-            }),
-        )
-    })?;
-    sync_ok.map_err(|e| {
-        (
+        .is_err()
+    {
+        return Ok(response_503_retry(
+            "WORKER_UNAVAILABLE",
+            "write worker unavailable, please retry after a few seconds",
+            5,
+        ));
+    }
+    let sync_ok = match rx.await {
+        Ok(ok) => ok,
+        Err(_) => {
+            return Ok(response_503_retry(
+                "WORKER_DROPPED",
+                "write worker dropped, please retry after a few seconds",
+                5,
+            ));
+        }
+    };
+    if let Err(e) = sync_ok {
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
                 code: "SYNC_ERROR".into(),
                 message: e,
             }),
-        )
-    })?;
+        ));
+    }
 
     let mut data = Vec::with_capacity(addresses.len());
     for addr in addresses {
@@ -1053,7 +1066,7 @@ async fn post_daily_stats(
         let job_ref = Arc::new(RwLock::new(job_state));
         state.jobs.write().await.insert(job_id.clone(), job_ref.clone());
 
-        state
+        if state
             .write_job_tx
             .send(WriteJob::BatchDailyStats {
                 job_id: job_id.clone(),
@@ -1062,15 +1075,14 @@ async fn post_daily_stats(
                 to_date: to_date.clone(),
             })
             .await
-            .map_err(|_| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorBody {
-                        code: "QUEUE_FULL".into(),
-                        message: "write worker unavailable".into(),
-                    }),
-                )
-            })?;
+            .is_err()
+        {
+            return Ok(response_503_retry(
+                "WORKER_UNAVAILABLE",
+                "write worker unavailable, please retry after a few seconds",
+                5,
+            ));
+        }
 
         return Ok((
             StatusCode::ACCEPTED,
@@ -1085,40 +1097,40 @@ async fn post_daily_stats(
 
     let path = &state.config.duckdb_path;
     let (tx, rx) = oneshot::channel();
-    state
+    if state
         .write_job_tx
         .send(WriteJob::SyncManyUntilYesterday {
             items: addresses.clone(),
             respond: tx,
         })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorBody {
-                    code: "QUEUE_FULL".into(),
-                    message: "write worker unavailable".into(),
-                }),
-            )
-        })?;
-    let sync_ok = rx.await.map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorBody {
-                code: "SYNC_ERROR".into(),
-                message: "write worker dropped".into(),
-            }),
-        )
-    })?;
-    sync_ok.map_err(|e| {
-        (
+        .is_err()
+    {
+        return Ok(response_503_retry(
+            "WORKER_UNAVAILABLE",
+            "write worker unavailable, please retry after a few seconds",
+            5,
+        ));
+    }
+    let sync_ok = match rx.await {
+        Ok(ok) => ok,
+        Err(_) => {
+            return Ok(response_503_retry(
+                "WORKER_DROPPED",
+                "write worker dropped, please retry after a few seconds",
+                5,
+            ));
+        }
+    };
+    if let Err(e) = sync_ok {
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
                 code: "SYNC_ERROR".into(),
                 message: e,
             }),
-        )
-    })?;
+        ));
+    }
 
     let mut data = Vec::with_capacity(addresses.len());
     for addr in addresses {
