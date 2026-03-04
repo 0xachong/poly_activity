@@ -248,3 +248,66 @@ fn recompute_effective_share_and_open_positions(db_path: &str, address: &str) ->
     db::replace_open_positions(db_path, address, &open_positions).map_err(|e| e.to_string())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn activity_row(
+        address: &str,
+        ts: i64,
+        type_: &str,
+        share: Option<f64>,
+        condition_id: Option<&str>,
+        token_id: Option<&str>,
+        transaction_hash: Option<&str>,
+    ) -> db::ActivityRow {
+        db::ActivityRow {
+            address: address.to_string(),
+            ts,
+            type_: type_.to_string(),
+            share,
+            price: None,
+            usdc_size: None,
+            title: None,
+            outcome: None,
+            condition_id: condition_id.map(|s| s.to_string()),
+            token_id: token_id.map(|s| s.to_string()),
+            transaction_hash: transaction_hash.map(|s| s.to_string()),
+            ts_utc: None,
+            effective_share: None,
+        }
+    }
+
+    /// 集成：写入 DB → 重算 effective_share → 读出，REDEEM 的 effective_share 应为 100（持仓）而非 API 的 50。
+    #[test]
+    fn redeem_effective_share_persisted_as_100() {
+        let dir = std::env::temp_dir()
+            .join("poly_activity_test")
+            .join(format!("{:?}", std::time::SystemTime::now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.duckdb");
+        let path_str = path.to_str().unwrap();
+        let addr = "0xtest";
+
+        db::init_schema(path_str).unwrap();
+
+        let condition = "0xac11f0d8d88a006cc3df2bb1cd545dd3e17d21036adad887d5035530a3780669";
+        let rows = vec![
+            activity_row(addr, 1000, "BUY", Some(100.0), Some(condition), Some("0xtoken_yes"), Some("0xtx1")),
+            activity_row(addr, 1001, "BUY", Some(50.0), Some(condition), Some("0xtoken_no"), Some("0xtx2")),
+            activity_row(addr, 1002, "REDEEM", Some(50.0), Some(condition), None, Some("0xtx3")),
+        ];
+        db::insert_activities_batch(path_str, &rows).unwrap();
+
+        recompute_effective_share_and_open_positions(path_str, addr).unwrap();
+
+        let (rows_out, _) = db::list_activities(path_str, addr, 0, 9999, 100, None).unwrap();
+        let redeem = rows_out.into_iter().find(|r| r.type_ == "REDEEM").expect("应有 REDEEM 行");
+        assert_eq!(
+            redeem.effective_share,
+            Some(100.0),
+            "API 给出的 REDEEM share 应为 100（持仓），而非 50"
+        );
+    }
+}

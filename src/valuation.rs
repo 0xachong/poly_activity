@@ -241,3 +241,73 @@ pub fn compute_daily_volume_and_realized_pnl(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(
+        ts: i64,
+        type_: &str,
+        share: Option<f64>,
+        condition_id: Option<&str>,
+        token_id: Option<&str>,
+        transaction_hash: Option<&str>,
+    ) -> ActivityRow {
+        ActivityRow {
+            address: "0xtest".to_string(),
+            ts,
+            type_: type_.to_string(),
+            share,
+            price: None,
+            usdc_size: None,
+            title: None,
+            outcome: None,
+            condition_id: condition_id.map(|s| s.to_string()),
+            token_id: token_id.map(|s| s.to_string()),
+            transaction_hash: transaction_hash.map(|s| s.to_string()),
+            ts_utc: None,
+            effective_share: None,
+        }
+    }
+
+    /// 场景：同一 condition 下两 token 持仓 100 与 50，REDEEM 无 token_id 且 API share=50。
+    /// 修复前会误选持仓 50 的 token；修复后应选持仓最大的 100。
+    #[test]
+    fn redeem_resolves_to_max_position_not_api_share() {
+        let condition = "0xac11f0d8d88a006cc3df2bb1cd545dd3e17d21036adad887d5035530a3780669";
+        let token_yes = "0xtoken_yes";
+        let token_no = "0xtoken_no";
+        let activities = vec![
+            row(1000, "BUY", Some(100.0), Some(condition), Some(token_yes), Some("0xtx1")),
+            row(1001, "BUY", Some(50.0), Some(condition), Some(token_no), Some("0xtx2")),
+            row(
+                1002,
+                "REDEEM",
+                Some(50.0), // API 返回 50
+                Some(condition),
+                None,   // 无 token_id
+                Some("0xtx3"),
+            ),
+        ];
+        let effective = effective_redeem_shares(&activities);
+        // REDEEM 应为持仓最大 token 的 100，而不是 API 的 50
+        assert_eq!(effective.len(), 3);
+        assert_eq!(effective[0], None);
+        assert_eq!(effective[1], None);
+        assert_eq!(effective[2], Some(100.0), "REDEEM 应取持仓最大 100，而非 API 的 50");
+    }
+
+    /// 单 token 持仓 100，REDEEM 无 token_id、API share=50，结果应为 100。
+    #[test]
+    fn redeem_single_token_uses_full_position() {
+        let condition = "0xcond_single";
+        let token = "0xtoken";
+        let activities = vec![
+            row(1000, "BUY", Some(100.0), Some(condition), Some(token), Some("0xtx1")),
+            row(1001, "REDEEM", Some(50.0), Some(condition), None, Some("0xtx2")),
+        ];
+        let effective = effective_redeem_shares(&activities);
+        assert_eq!(effective[1], Some(100.0));
+    }
+}
