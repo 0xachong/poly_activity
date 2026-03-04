@@ -126,6 +126,16 @@ pub async fn run_write_worker(mut job_rx: mpsc::Receiver<WriteJob>, state: Arc<A
                     Some(r) => r,
                     None => continue,
                 };
+                // 整批任务持有一把跨进程文件锁，避免与其它进程在地址边界交错写导致 DuckDB Invalid bitmask
+                let _db_guard = match db::open_write_lock(path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let mut j = job_ref.write().await;
+                        j.status = JobStatus::Failed;
+                        j.error = Some(e.to_string());
+                        continue;
+                    }
+                };
                 let mut out = Vec::with_capacity(addresses.len());
                 for (i, addr) in addresses.iter().enumerate() {
                     if force_refresh {
@@ -223,6 +233,16 @@ pub async fn run_write_worker(mut job_rx: mpsc::Receiver<WriteJob>, state: Arc<A
                 let job_ref = match state.jobs.read().await.get(&job_id).cloned() {
                     Some(r) => r,
                     None => continue,
+                };
+                // 整批任务持有一把跨进程文件锁，避免与其它进程在地址边界交错写导致 DuckDB Invalid bitmask
+                let _db_guard = match db::open_write_lock(path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let mut j = job_ref.write().await;
+                        j.status = JobStatus::Failed;
+                        j.error = Some(e.to_string());
+                        continue;
+                    }
                 };
                 let sync_to_ts = end_of_yesterday_ts();
                 let from_ts = 0i64;

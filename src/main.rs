@@ -16,6 +16,7 @@ use api::{router, run_write_worker, AppState};
 use config::Config;
 use rate_limit::RateLimiter;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,12 +48,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     tokio::spawn(run_write_worker(write_job_rx, state.clone()));
 
-    let app = router(state).layer(
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods(Any)
-            .allow_headers(Any),
-    );
+    let app = router(state)
+        .layer(
+            TraceLayer::new_for_http()
+                .on_request(|req: &axum::http::Request<axum::body::Body>, _span: &tracing::Span| {
+                    tracing::info!(method = %req.method(), uri = %req.uri(), "request");
+                })
+                .on_response(|_res: &axum::http::Response<_>, _latency: std::time::Duration, _span: &tracing::Span| {
+                    tracing::info!(status = %_res.status(), "response");
+                }),
+        )
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        );
     let bind = format!("0.0.0.0:{}", config.http_port);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("listening on http://{}", bind);
