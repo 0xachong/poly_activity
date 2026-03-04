@@ -29,10 +29,20 @@
 
 ---
 
+## 批量接口：超限时 202 + 后台任务与进度
+
+- **GET /daily-stats**（逗号分隔多钱包）、**POST /daily-stats**（body.wallets）、**POST /wallets/activity**（body.addresses）单次请求地址数由 `MAX_BATCH_ADDRESSES`（默认 50）控制。
+- **未超限**：同步处理并直接返回 200 与结果。
+- **超限**：立即返回 **202 Accepted**，body 为 `{ "job_id", "message": "地址较多，正在后台处理…", "progress_url": "/jobs/{job_id}" }`；服务在后台按地址逐个同步并聚合，前端可轮询 **GET /jobs/:job_id** 获取进度与结果。
+- **GET /jobs/:job_id**：返回 `{ id, kind, total, completed, status: "pending"|"running"|"done"|"failed", message?, error?, result? }`。`status` 为 `done` 时 `result` 为对应接口的完整结果（daily-stats 或 activity 批量）；`failed` 时 `error` 为原因。
+
+---
+
 ## 小结
 
 - **历史交易**：`GET /wallets/:address/activity`，可选 `force_refresh` 清空重拉。
 - **未平仓**：`GET /wallets/:address/open-positions`，返回当前未平仓 token 列表。
 - **每日统计**：`GET /daily-stats?wallet=0x...&from_date=...&to_date=...`，得到每日 volume（仅 BUY）与 profit（仅卖出赚亏）。
+- **批量上限**：通过 `MAX_BATCH_ADDRESSES`（默认 50）限制单次请求地址数。
 
 前端页面已移至 `frontend/` 目录（dashboard、account-detail、account-manage）。

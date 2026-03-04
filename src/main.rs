@@ -8,7 +8,9 @@ mod sync;
 mod valuation;
 mod positions;
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use api::{router, AppState};
 use config::Config;
@@ -39,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         rate_limiter,
         client,
+        jobs: Arc::new(RwLock::new(HashMap::new())),
     });
 
     let app = router(state).layer(

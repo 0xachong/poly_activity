@@ -3,13 +3,15 @@
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     Json, Router,
 };
 use axum::body::Body;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::config::Config;
 use crate::db;
@@ -18,10 +20,38 @@ use crate::sync;
 use crate::valuation;
 use reqwest::Client;
 
+/// 批量任务状态（地址数超过上限时异步处理，前端轮询进度）
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct JobState {
+    pub id: String,
+    pub kind: String, // "daily_stats" | "activity"
+    pub total: usize,
+    pub completed: usize,
+    pub status: JobStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    pub created_at: i64,
+}
+
 pub struct AppState {
     pub config: Config,
     pub rate_limiter: Arc<RateLimiter>,
     pub client: Client,
+    /// 批量任务：job_id -> 任务状态（超过 max_batch_addresses 时创建）
+    pub jobs: Arc<RwLock<HashMap<String, Arc<RwLock<JobState>>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +180,14 @@ pub struct ErrorBody {
     pub message: String,
 }
 
+/// 地址数超限时返回 202，前端轮询 progress_url 获取进度与结果
+#[derive(Serialize)]
+pub struct JobAccepted {
+    pub job_id: String,
+    pub message: String,
+    pub progress_url: String,
+}
+
 #[derive(Serialize)]
 pub struct OpenPositionItem {
     pub token_id: String,
@@ -203,6 +241,23 @@ async fn get_open_positions(
         total,
         data,
     }))
+}
+
+/// GET /jobs/:job_id — 查询批量任务进度与结果（地址数超限时返回 202，前端轮询此接口）
+async fn get_job_progress(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobState>, (StatusCode, Json<ErrorBody>)> {
+    let jobs = state.jobs.read().await;
+    let job_ref = jobs.get(&job_id).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(ErrorBody {
+            code: "NOT_FOUND".into(),
+            message: "job not found or expired".into(),
+        }),
+    ))?;
+    let job = job_ref.read().await.clone();
+    Ok(Json(job))
 }
 
 /// GET /wallets/:address/activity — 某钱包某段时间历史交易；force_refresh=true 时清空后从 Polymarket 重拉
@@ -358,11 +413,166 @@ async fn get_wallet_activity(
     }))
 }
 
-/// POST /wallets/activity — 批量钱包历史交易；body.addresses 多个地址，同一 from_ts/to_ts；force_refresh 对所有地址生效
+/// POST /wallets/activity — 批量钱包历史交易；body.addresses 多个地址，同一 from_ts/to_ts；force_refresh 对所有地址生效；地址数超限时返回 202 + job_id
 async fn post_wallets_activity(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BatchActivityBody>,
-) -> Result<Json<BatchActivityResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let addresses: Vec<String> = body
+        .addresses
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty() && s.starts_with("0x"))
+        .collect();
+    if addresses.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                code: "BAD_REQUEST".into(),
+                message: "addresses required and must be valid 0x".into(),
+            }),
+        ));
+    }
+    if addresses.len() > state.config.max_batch_addresses {
+        let job_id = Uuid::new_v4().to_string();
+        let job_state = JobState {
+            id: job_id.clone(),
+            kind: "activity".to_string(),
+            total: addresses.len(),
+            completed: 0,
+            status: JobStatus::Pending,
+            message: Some("处理中，请稍后轮询进度或重试".to_string()),
+            error: None,
+            result: None,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        let job_ref = Arc::new(RwLock::new(job_state));
+        state.jobs.write().await.insert(job_id.clone(), job_ref.clone());
+
+        let config = state.config.clone();
+        let path = state.config.duckdb_path.clone();
+        let rate_limiter = state.rate_limiter.clone();
+        let client = state.client.clone();
+        let from_ts = body.from_ts;
+        let to_ts = body.to_ts.unwrap_or_else(|| chrono::Utc::now().timestamp());
+        let limit = body.limit;
+        let force_refresh = body.force_refresh;
+        tokio::spawn(async move {
+            let mut out = Vec::with_capacity(addresses.len());
+            for (i, addr) in addresses.iter().enumerate() {
+                if force_refresh {
+                    let _ = db::delete_activities_for_address(&path, addr);
+                    if let Err(e) = sync::sync_range(
+                        &config,
+                        &path,
+                        rate_limiter.as_ref(),
+                        &client,
+                        addr,
+                        0,
+                        to_ts,
+                    )
+                    .await
+                    {
+                        let mut j = job_ref.write().await;
+                        j.status = JobStatus::Failed;
+                        j.error = Some(e);
+                        return;
+                    }
+                } else if let Err(e) = sync::sync_range(
+                    &config,
+                    &path,
+                    rate_limiter.as_ref(),
+                    &client,
+                    addr,
+                    from_ts,
+                    to_ts,
+                )
+                .await
+                {
+                    let mut j = job_ref.write().await;
+                    j.status = JobStatus::Failed;
+                    j.error = Some(e);
+                    return;
+                }
+                let mut j = job_ref.write().await;
+                j.completed = i + 1;
+                j.status = JobStatus::Running;
+
+                let (rows, total) =
+                    db::list_activities(&path, addr, from_ts, to_ts, limit, None).unwrap_or((vec![], 0));
+                let need_fallback = rows.iter().any(|r| r.type_.eq_ignore_ascii_case("REDEEM") && r.effective_share.is_none());
+                let eff_ts = rows.iter().map(|r| r.ts).max().unwrap_or(to_ts);
+                let effective_redeem = if need_fallback {
+                    effective_redeem_share_map(&path, addr, eff_ts)
+                } else {
+                    HashMap::new()
+                };
+                let d: Vec<ActivityItemCompact> = rows
+                    .into_iter()
+                    .map(|r| {
+                        let share = if r.type_.eq_ignore_ascii_case("REDEEM") {
+                            r.effective_share
+                                .or_else(|| {
+                                    effective_redeem.get(&(
+                                        r.ts,
+                                        r.transaction_hash.clone(),
+                                        r.condition_id.clone(),
+                                        r.token_id.clone(),
+                                    )).copied()
+                                })
+                                .or(r.share)
+                        } else {
+                            r.share
+                        };
+                        ActivityItemCompact {
+                            ts: r.ts,
+                            type_: r.type_,
+                            share,
+                            price: r.price,
+                            title: r.title,
+                            outcome: r.outcome,
+                            condition_id: r.condition_id,
+                            token_id: r.token_id,
+                            transaction_hash: r.transaction_hash,
+                        }
+                    })
+                    .collect();
+                let from_time = d.iter().map(|x| x.ts).min().and_then(|ts| {
+                    chrono::DateTime::from_timestamp(ts, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                });
+                let to_time = d.iter().map(|x| x.ts).max().and_then(|ts| {
+                    chrono::DateTime::from_timestamp(ts, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                });
+                out.push(WalletActivityItem {
+                    address: addr.clone(),
+                    total,
+                    from_time,
+                    to_time,
+                    data: d,
+                });
+            }
+            let response = BatchActivityResponse { data: out };
+            if let Ok(v) = serde_json::to_value(&response) {
+                let mut j = job_ref.write().await;
+                j.result = Some(v);
+                j.status = JobStatus::Done;
+                j.message = None;
+            }
+        });
+
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(JobAccepted {
+                job_id: job_id.clone(),
+                message: "地址较多，正在后台处理，请轮询进度或稍后重试".to_string(),
+                progress_url: format!("/jobs/{}", job_id),
+            }),
+        )
+            .into_response());
+    }
+
     let to_ts = body.to_ts.unwrap_or_else(|| chrono::Utc::now().timestamp());
     let path = &state.config.duckdb_path;
     let mut out = Vec::with_capacity(body.addresses.len());
@@ -460,7 +670,7 @@ async fn post_wallets_activity(
             data: d,
         });
     }
-    Ok(Json(BatchActivityResponse { data: out }))
+    Ok((StatusCode::OK, Json(BatchActivityResponse { data: out })).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -493,11 +703,11 @@ pub struct DailyStatsResponse {
     pub data: Vec<WalletDailyStats>,
 }
 
-/// GET /daily-stats — 指定钱包（可逗号分隔多个）、日期区间内每日交易额（仅 BUY）与已实现利润
+/// GET /daily-stats — 指定钱包（可逗号分隔多个）、日期区间内每日交易额（仅 BUY）与已实现利润；地址数超限时返回 202 + job_id
 async fn get_daily_stats(
     State(state): State<Arc<AppState>>,
     Query(q): Query<DailyStatsQuery>,
-) -> Result<Json<DailyStatsResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
     let raw = q
         .wallet
         .or(q.address)
@@ -523,6 +733,97 @@ async fn get_daily_stats(
         ));
     }
 
+    let from_date = q.from_date.trim().to_string();
+    let to_date = q.to_date.trim().to_string();
+    let to_ts = chrono::NaiveDate::parse_from_str(q.to_date.trim(), "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(23, 59, 59))
+        .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+    if addresses.len() > state.config.max_batch_addresses {
+        let job_id = Uuid::new_v4().to_string();
+        let job_state = JobState {
+            id: job_id.clone(),
+            kind: "daily_stats".to_string(),
+            total: addresses.len(),
+            completed: 0,
+            status: JobStatus::Pending,
+            message: Some("处理中，请稍后轮询进度或重试".to_string()),
+            error: None,
+            result: None,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        let job_ref = Arc::new(RwLock::new(job_state));
+        state.jobs.write().await.insert(job_id.clone(), job_ref.clone());
+
+        let config = state.config.clone();
+        let path = state.config.duckdb_path.clone();
+        let rate_limiter = state.rate_limiter.clone();
+        let client = state.client.clone();
+        let addrs = addresses.clone();
+        tokio::spawn(async move {
+            let sync_to_ts = end_of_yesterday_ts();
+            let from_ts = 0i64;
+            for (i, addr) in addrs.iter().enumerate() {
+                if let Err(e) = sync::sync_range(
+                    &config,
+                    &path,
+                    rate_limiter.as_ref(),
+                    &client,
+                    addr,
+                    0,
+                    sync_to_ts,
+                )
+                .await
+                {
+                    let mut j = job_ref.write().await;
+                    j.status = JobStatus::Failed;
+                    j.error = Some(e);
+                    return;
+                }
+                let mut j = job_ref.write().await;
+                j.completed = i + 1;
+                j.status = JobStatus::Running;
+            }
+            let mut data = Vec::with_capacity(addrs.len());
+            for addr in &addrs {
+                let activities =
+                    db::list_activities_in_range(&path, addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
+                let daily = valuation::compute_daily_volume_and_realized_pnl(&activities, &from_date, &to_date);
+                let daily_points: Vec<DailyStatsPoint> = daily
+                    .into_iter()
+                    .map(|(date, volume, profit)| DailyStatsPoint {
+                        date,
+                        volume,
+                        profit,
+                    })
+                    .collect();
+                data.push(WalletDailyStats {
+                    wallet: addr.clone(),
+                    daily: daily_points,
+                });
+            }
+            let response = DailyStatsResponse { data };
+            if let Ok(v) = serde_json::to_value(&response) {
+                let mut j = job_ref.write().await;
+                j.result = Some(v);
+                j.status = JobStatus::Done;
+                j.message = None;
+            }
+        });
+
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(JobAccepted {
+                job_id: job_id.clone(),
+                message: "地址较多，正在后台处理，请轮询进度或稍后重试".to_string(),
+                progress_url: format!("/jobs/{}", job_id),
+            }),
+        )
+            .into_response());
+    }
+
     let path = &state.config.duckdb_path;
     let from_ts = 0i64;
     let to_ts = chrono::NaiveDate::parse_from_str(q.to_date.trim(), "%Y-%m-%d")
@@ -530,8 +831,6 @@ async fn get_daily_stats(
         .and_then(|d| d.and_hms_opt(23, 59, 59))
         .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
-    let from_date = q.from_date.trim().to_string();
-    let to_date = q.to_date.trim().to_string();
 
     // 先按「截止到前一天」同步基础数据，再读库算统计；避免每次请求都拉当天数据，每天触发一次即可
     let sync_to_ts = end_of_yesterday_ts();
@@ -575,7 +874,7 @@ async fn get_daily_stats(
             daily: daily_points,
         });
     }
-    Ok(Json(DailyStatsResponse { data }))
+    Ok((StatusCode::OK, Json(DailyStatsResponse { data })).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -585,11 +884,11 @@ pub struct BatchDailyStatsBody {
     pub to_date: String,
 }
 
-/// POST /daily-stats — 批量钱包聚合数据（每日交易额与已实现利润），Body: wallets、from_date、to_date
+/// POST /daily-stats — 批量钱包聚合数据（每日交易额与已实现利润），Body: wallets、from_date、to_date；地址数超限时返回 202 + job_id，前端轮询 GET /jobs/:job_id
 async fn post_daily_stats(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BatchDailyStatsBody>,
-) -> Result<Json<DailyStatsResponse>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
     let addresses: Vec<String> = body
         .wallets
         .iter()
@@ -606,7 +905,7 @@ async fn post_daily_stats(
         ));
     }
 
-    let path = &state.config.duckdb_path;
+    let path = state.config.duckdb_path.clone();
     let from_ts = 0i64;
     let to_ts = chrono::NaiveDate::parse_from_str(body.to_date.trim(), "%Y-%m-%d")
         .ok()
@@ -616,7 +915,88 @@ async fn post_daily_stats(
     let from_date = body.from_date.trim().to_string();
     let to_date = body.to_date.trim().to_string();
 
-    // 先按「截止到前一天」同步基础数据，再读库算统计
+    if addresses.len() > state.config.max_batch_addresses {
+        let job_id = Uuid::new_v4().to_string();
+        let total = addresses.len();
+        let job_state = JobState {
+            id: job_id.clone(),
+            kind: "daily_stats".to_string(),
+            total,
+            completed: 0,
+            status: JobStatus::Pending,
+            message: Some("处理中，请稍后轮询进度或重试".to_string()),
+            error: None,
+            result: None,
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        let job_ref = Arc::new(RwLock::new(job_state));
+        state.jobs.write().await.insert(job_id.clone(), job_ref.clone());
+
+        let config = state.config.clone();
+        let rate_limiter = state.rate_limiter.clone();
+        let client = state.client.clone();
+        tokio::spawn(async move {
+            let sync_to_ts = end_of_yesterday_ts();
+            for (i, addr) in addresses.iter().enumerate() {
+                if let Err(e) = sync::sync_range(
+                    &config,
+                    &path,
+                    rate_limiter.as_ref(),
+                    &client,
+                    addr,
+                    0,
+                    sync_to_ts,
+                )
+                .await
+                {
+                    let mut j = job_ref.write().await;
+                    j.status = JobStatus::Failed;
+                    j.error = Some(e);
+                    return;
+                }
+                let mut j = job_ref.write().await;
+                j.completed = i + 1;
+                j.status = JobStatus::Running;
+            }
+            let mut data = Vec::with_capacity(addresses.len());
+            for addr in &addresses {
+                let activities =
+                    db::list_activities_in_range(&path, addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
+                let daily = valuation::compute_daily_volume_and_realized_pnl(&activities, &from_date, &to_date);
+                let daily_points: Vec<DailyStatsPoint> = daily
+                    .into_iter()
+                    .map(|(date, volume, profit)| DailyStatsPoint {
+                        date,
+                        volume,
+                        profit,
+                    })
+                    .collect();
+                data.push(WalletDailyStats {
+                    wallet: addr.clone(),
+                    daily: daily_points,
+                });
+            }
+            let response = DailyStatsResponse { data };
+            if let Ok(v) = serde_json::to_value(&response) {
+                let mut j = job_ref.write().await;
+                j.result = Some(v);
+                j.status = JobStatus::Done;
+                j.message = None;
+            }
+        });
+
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(JobAccepted {
+                job_id: job_id.clone(),
+                message: "地址较多，正在后台处理，请轮询进度或稍后重试".to_string(),
+                progress_url: format!("/jobs/{}", job_id),
+            }),
+        )
+            .into_response());
+    }
+
+    let path = &state.config.duckdb_path;
     let sync_to_ts = end_of_yesterday_ts();
     for addr in &addresses {
         if let Err(e) = sync::sync_range(
@@ -658,7 +1038,7 @@ async fn post_daily_stats(
             daily: daily_points,
         });
     }
-    Ok(Json(DailyStatsResponse { data }))
+    Ok((StatusCode::OK, Json(DailyStatsResponse { data })).into_response())
 }
 
 /// GET /llms.txt — 面向 LLM 的本服务说明（Markdown）
@@ -702,6 +1082,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/wallets/:address/open-positions",
             axum::routing::get(get_open_positions),
         )
+        .route("/jobs/:job_id", axum::routing::get(get_job_progress))
         .route("/daily-stats", axum::routing::get(get_daily_stats).post(post_daily_stats))
         .with_state(state)
 }

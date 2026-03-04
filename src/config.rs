@@ -11,6 +11,8 @@ pub struct Config {
     pub http_port: u16,
     pub request_timeout_secs: u64,
     pub fetch_batch_limit: u32,
+    /// 批量接口（activity 批量、daily-stats 多钱包）最多允许的地址数量，防止单次请求拖垮服务或打满 Polymarket 限流
+    pub max_batch_addresses: usize,
 }
 
 impl Config {
@@ -40,6 +42,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(500),
+            max_batch_addresses: env::var("MAX_BATCH_ADDRESSES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50),
         }
     }
 }
