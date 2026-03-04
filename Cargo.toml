@@ -8,6 +8,7 @@ description = "Polymarket wallet activity cache backend"
 axum = { version = "0.7", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "net"] }
 duckdb = { version = "1", features = ["bundled"] }
+fs4 = "0.6"
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

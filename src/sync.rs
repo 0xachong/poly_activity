@@ -147,7 +147,7 @@ async fn fetch_segment(
             .collect();
 
         let n = rows.len() as u64;
-        db::insert_activities_batch(db_path, &rows).map_err(|e| e.to_string())?;
+        db::insert_activities_batch_unlocked(db_path, &rows).map_err(|e| e.to_string())?;
         total_inserted += n;
 
         let max_ts = rows.iter().map(|r| r.ts).max().unwrap_or(batch_start);
@@ -166,6 +166,7 @@ async fn fetch_segment(
 }
 
 /// 按请求区间 [from_ts, to_ts] 同步：取库中已有区间补缺口拉取并写入。
+/// 整段持有一把跨进程写锁，避免每批 insert 都加锁，减少锁竞争与 syscall。
 pub async fn sync_range(
     config: &Config,
     db_path: &str,
@@ -179,6 +180,8 @@ pub async fn sync_range(
     if from_ts > to_ts {
         return Ok(0);
     }
+
+    let _guard = db::open_write_lock(db_path).map_err(|e| e.to_string())?;
 
     let range = db::get_ts_range(db_path, &addr).map_err(|e| e.to_string())?;
     let mut total = 0u64;
@@ -203,8 +206,8 @@ pub async fn sync_range(
         }
     }
 
-    // 同步后按时间序重算：REDEEM 的 effective_share 写入 activities，当前未平仓写入 open_positions
-    if let Err(e) = recompute_effective_share_and_open_positions(db_path, &addr) {
+    // 同步后按时间序重算：REDEEM 的 effective_share 写入 activities，当前未平仓写入 open_positions（本段已持锁，用 _unlocked）
+    if let Err(e) = recompute_effective_share_and_open_positions(db_path, &addr, true) {
         tracing::warn!(address = %addr, err = %e, "recompute effective_share and open_positions failed");
     }
 
@@ -212,7 +215,12 @@ pub async fn sync_range(
 }
 
 /// 按该地址全量活动重算 REDEEM 的 effective_share 与当前未平仓，并落库。
-fn recompute_effective_share_and_open_positions(db_path: &str, address: &str) -> Result<(), String> {
+/// caller_holds_lock：true 表示调用方已持有 db 写锁，使用 _unlocked 写接口避免死锁。
+fn recompute_effective_share_and_open_positions(
+    db_path: &str,
+    address: &str,
+    caller_holds_lock: bool,
+) -> Result<(), String> {
     let (min_ts, max_ts) = match db::get_ts_range(db_path, address).map_err(|e| e.to_string())? {
         Some(r) => r,
         None => return Ok(()),
@@ -244,8 +252,14 @@ fn recompute_effective_share_and_open_positions(db_path: &str, address: &str) ->
         .iter()
         .map(|(a, b, c, d)| (a.as_str(), b.as_str(), c.as_str(), *d))
         .collect();
-    db::update_effective_share_for_redeems(db_path, address, &updates_ref).map_err(|e| e.to_string())?;
-    db::replace_open_positions(db_path, address, &open_positions).map_err(|e| e.to_string())?;
+    if caller_holds_lock {
+        db::update_effective_share_for_redeems_unlocked(db_path, address, &updates_ref)
+            .map_err(|e| e.to_string())?;
+        db::replace_open_positions_unlocked(db_path, address, &open_positions).map_err(|e| e.to_string())?;
+    } else {
+        db::update_effective_share_for_redeems(db_path, address, &updates_ref).map_err(|e| e.to_string())?;
+        db::replace_open_positions(db_path, address, &open_positions).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -300,7 +314,7 @@ mod tests {
         ];
         db::insert_activities_batch(path_str, &rows).unwrap();
 
-        recompute_effective_share_and_open_positions(path_str, addr).unwrap();
+        recompute_effective_share_and_open_positions(path_str, addr, false).unwrap();
 
         let (rows_out, _) = db::list_activities(path_str, addr, 0, 9999, 100, None).unwrap();
         let redeem = rows_out.into_iter().find(|r| r.type_ == "REDEEM").expect("应有 REDEEM 行");

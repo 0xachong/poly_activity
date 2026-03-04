@@ -10,7 +10,7 @@ use axum::body::Body;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -19,6 +19,262 @@ use crate::rate_limit::RateLimiter;
 use crate::sync;
 use crate::valuation;
 use reqwest::Client;
+
+// ---------- 写任务队列：单一 worker 串行执行所有写库，替代各处持锁 ----------
+
+/// 需要独占写库的操作，由后台 worker 串行执行
+pub enum WriteJob {
+    /// 同步单个地址，完成后通过 oneshot 返回结果
+    SyncOne {
+        address: String,
+        from_ts: i64,
+        to_ts: i64,
+        force_refresh: bool,
+        respond: oneshot::Sender<Result<u64, String>>,
+    },
+    /// 同步多个地址（小批量），全部完成后返回 Ok(()) 或首个 Err
+    SyncMany {
+        items: Vec<(String, i64, i64, bool)>, // (address, from_ts, to_ts, force_refresh)
+        respond: oneshot::Sender<Result<(), String>>,
+    },
+    /// 同步到昨日并聚合：用于 GET daily-stats 多地址；worker 会更新 JobState
+    SyncManyUntilYesterday {
+        items: Vec<String>, // addresses
+        respond: oneshot::Sender<Result<(), String>>,
+    },
+    /// 批量 activity 任务（超限 202）：worker 内完成 sync + 读库 + 写 JobState
+    BatchActivity {
+        job_id: String,
+        addresses: Vec<String>,
+        from_ts: i64,
+        to_ts: i64,
+        limit: u32,
+        force_refresh: bool,
+    },
+    /// 批量 daily_stats 任务（超限 202）
+    BatchDailyStats {
+        job_id: String,
+        addresses: Vec<String>,
+        from_date: String,
+        to_date: String,
+    },
+}
+
+/// 后台写 worker：从 channel 取任务并串行执行，无锁竞争
+pub async fn run_write_worker(mut job_rx: mpsc::Receiver<WriteJob>, state: Arc<AppState>) {
+    let config = &state.config;
+    let path = &state.config.duckdb_path;
+    let rate_limiter = state.rate_limiter.as_ref();
+    let client = &state.client;
+
+    while let Some(job) = job_rx.recv().await {
+        match job {
+            WriteJob::SyncOne {
+                address,
+                from_ts,
+                to_ts,
+                force_refresh,
+                respond,
+            } => {
+                let addr = address.to_lowercase();
+                let result = if force_refresh {
+                    let _ = db::delete_activities_for_address(path, &addr);
+                    sync::sync_range(config, path, rate_limiter, client, &addr, 0, to_ts).await
+                } else {
+                    sync::sync_range(config, path, rate_limiter, client, &addr, from_ts, to_ts).await
+                };
+                let _ = respond.send(result);
+            }
+            WriteJob::SyncMany { items, respond } => {
+                let mut first_err: Option<String> = None;
+                for (addr, from_ts, to_ts, force_refresh) in items {
+                    let res = if force_refresh {
+                        let _ = db::delete_activities_for_address(path, &addr);
+                        sync::sync_range(config, path, rate_limiter, client, &addr, 0, to_ts).await
+                    } else {
+                        sync::sync_range(config, path, rate_limiter, client, &addr, from_ts, to_ts).await
+                    };
+                    if let Err(e) = res {
+                        first_err = Some(e);
+                        break;
+                    }
+                }
+                let _ = respond.send(first_err.map_or(Ok(()), Err));
+            }
+            WriteJob::SyncManyUntilYesterday { items, respond } => {
+                let sync_to_ts = end_of_yesterday_ts();
+                let mut first_err: Option<String> = None;
+                for addr in items {
+                    if let Err(e) =
+                        sync::sync_range(config, path, rate_limiter, client, &addr, 0, sync_to_ts).await
+                    {
+                        first_err = Some(e);
+                        break;
+                    }
+                }
+                let _ = respond.send(first_err.map_or(Ok(()), Err));
+            }
+            WriteJob::BatchActivity {
+                job_id,
+                addresses,
+                from_ts,
+                to_ts,
+                limit,
+                force_refresh,
+            } => {
+                let job_ref = match state.jobs.read().await.get(&job_id).cloned() {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let mut out = Vec::with_capacity(addresses.len());
+                for (i, addr) in addresses.iter().enumerate() {
+                    if force_refresh {
+                        let _ = db::delete_activities_for_address(path, addr);
+                        if let Err(e) =
+                            sync::sync_range(config, path, rate_limiter, client, addr, 0, to_ts).await
+                        {
+                            let mut j = job_ref.write().await;
+                            j.status = JobStatus::Failed;
+                            j.error = Some(e);
+                            return;
+                        }
+                    } else if let Err(e) = sync::sync_range(config, path, rate_limiter, client, addr, from_ts, to_ts)
+                        .await
+                    {
+                        let mut j = job_ref.write().await;
+                        j.status = JobStatus::Failed;
+                        j.error = Some(e);
+                        return;
+                    }
+                    {
+                        let mut j = job_ref.write().await;
+                        j.completed = i + 1;
+                        j.status = JobStatus::Running;
+                    }
+                    let (rows, total) =
+                        db::list_activities(path, addr, from_ts, to_ts, limit, None).unwrap_or((vec![], 0));
+                    let need_fallback =
+                        rows.iter().any(|r| r.type_.eq_ignore_ascii_case("REDEEM") && r.effective_share.is_none());
+                    let eff_ts = rows.iter().map(|r| r.ts).max().unwrap_or(to_ts);
+                    let effective_redeem = if need_fallback {
+                        effective_redeem_share_map(path, addr, eff_ts)
+                    } else {
+                        HashMap::new()
+                    };
+                    let d: Vec<ActivityItemCompact> = rows
+                        .into_iter()
+                        .map(|r| {
+                            let share = if r.type_.eq_ignore_ascii_case("REDEEM") {
+                                r.effective_share
+                                    .or_else(|| {
+                                        effective_redeem.get(&(
+                                            r.ts,
+                                            r.transaction_hash.clone(),
+                                            r.condition_id.clone(),
+                                            r.token_id.clone(),
+                                        ))
+                                        .copied()
+                                    })
+                                    .or(r.share)
+                            } else {
+                                r.share
+                            };
+                            ActivityItemCompact {
+                                ts: r.ts,
+                                type_: r.type_,
+                                share,
+                                price: r.price,
+                                title: r.title,
+                                outcome: r.outcome,
+                                condition_id: r.condition_id,
+                                token_id: r.token_id,
+                                transaction_hash: r.transaction_hash,
+                            }
+                        })
+                        .collect();
+                    let from_time = d.iter().map(|x| x.ts).min().and_then(|ts| {
+                        chrono::DateTime::from_timestamp(ts, 0).map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    });
+                    let to_time = d.iter().map(|x| x.ts).max().and_then(|ts| {
+                        chrono::DateTime::from_timestamp(ts, 0).map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    });
+                    out.push(WalletActivityItem {
+                        address: addr.clone(),
+                        total,
+                        from_time,
+                        to_time,
+                        data: d,
+                    });
+                }
+                let response = BatchActivityResponse { data: out };
+                if let Ok(v) = serde_json::to_value(&response) {
+                    let mut j = job_ref.write().await;
+                    j.result = Some(v);
+                    j.status = JobStatus::Done;
+                    j.message = None;
+                }
+            }
+            WriteJob::BatchDailyStats {
+                job_id,
+                addresses,
+                from_date,
+                to_date,
+            } => {
+                let job_ref = match state.jobs.read().await.get(&job_id).cloned() {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let sync_to_ts = end_of_yesterday_ts();
+                let from_ts = 0i64;
+                let to_ts = chrono::NaiveDate::parse_from_str(to_date.trim(), "%Y-%m-%d")
+                    .ok()
+                    .and_then(|d| d.and_hms_opt(23, 59, 59))
+                    .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+                for (i, addr) in addresses.iter().enumerate() {
+                    if let Err(e) =
+                        sync::sync_range(config, path, rate_limiter, client, addr, 0, sync_to_ts).await
+                    {
+                        let mut j = job_ref.write().await;
+                        j.status = JobStatus::Failed;
+                        j.error = Some(e);
+                        return;
+                    }
+                    let mut j = job_ref.write().await;
+                    j.completed = i + 1;
+                    j.status = JobStatus::Running;
+                }
+                let mut data = Vec::with_capacity(addresses.len());
+                for addr in &addresses {
+                    let activities =
+                        db::list_activities_in_range(path, addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
+                    let daily =
+                        valuation::compute_daily_volume_and_realized_pnl(&activities, &from_date, &to_date);
+                    let daily_points: Vec<DailyStatsPoint> = daily
+                        .into_iter()
+                        .map(|(date, volume, profit)| DailyStatsPoint {
+                            date,
+                            volume,
+                            profit,
+                        })
+                        .collect();
+                    data.push(WalletDailyStats {
+                        wallet: addr.clone(),
+                        daily: daily_points,
+                    });
+                }
+                let response = DailyStatsResponse { data };
+                if let Ok(v) = serde_json::to_value(&response) {
+                    let mut j = job_ref.write().await;
+                    j.result = Some(v);
+                    j.status = JobStatus::Done;
+                    j.message = None;
+                }
+            }
+        }
+    }
+}
 
 /// 批量任务状态（地址数超过上限时异步处理，前端轮询进度）
 #[derive(Clone, Debug, Serialize)]
@@ -52,8 +308,8 @@ pub struct AppState {
     pub client: Client,
     /// 批量任务：job_id -> 任务状态（超过 max_batch_addresses 时创建）
     pub jobs: Arc<RwLock<HashMap<String, Arc<RwLock<JobState>>>>>,
-    /// DuckDB 单写：所有写库（sync、recompute）串行化，避免并发写导致 Invalid bitmask for FixedSizeAllocator
-    pub db_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 写任务队列：所有写库操作由此 channel 入队，由 run_write_worker 串行执行，无锁
+    pub write_job_tx: mpsc::Sender<WriteJob>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,58 +545,46 @@ async fn get_wallet_activity(
     }
 
     let path = &state.config.duckdb_path;
-    if q.force_refresh {
-        let n = db::delete_activities_for_address(path, &addr).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorBody {
-                    code: "DB_ERROR".into(),
-                    message: e.to_string(),
-                }),
-            )
-        })?;
-        tracing::info!(address = %addr, deleted = n, "force_refresh: cleared activities");
-        let _guard = state.db_write_lock.lock().await;
-        sync::sync_range(
-            &state.config,
-            path,
-            state.rate_limiter.as_ref(),
-            &state.client,
-            &addr,
-            0,
-            to_ts,
-        )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorBody {
-                    code: "SYNC_ERROR".into(),
-                    message: e,
-                }),
-            )
-        })?;
-    } else {
-        let _guard = state.db_write_lock.lock().await;
-        sync::sync_range(
-            &state.config,
-            path,
-            state.rate_limiter.as_ref(),
-            &state.client,
-            &addr,
+    let (tx, rx) = oneshot::channel();
+    state
+        .write_job_tx
+        .send(WriteJob::SyncOne {
+            address: addr.clone(),
             from_ts,
             to_ts,
-        )
+            force_refresh: q.force_refresh,
+            respond: tx,
+        })
         .await
-        .map_err(|e| {
+        .map_err(|_| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorBody {
-                    code: "SYNC_ERROR".into(),
-                    message: e,
+                    code: "QUEUE_FULL".into(),
+                    message: "write worker unavailable".into(),
                 }),
             )
         })?;
+    let sync_result = rx.await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                code: "SYNC_ERROR".into(),
+                message: "write worker dropped".into(),
+            }),
+        )
+    })?;
+    sync_result.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                code: "SYNC_ERROR".into(),
+                message: e,
+            }),
+        )
+    })?;
+    if q.force_refresh {
+        tracing::info!(address = %addr, "force_refresh: sync completed");
     }
 
     let (rows, total) = db::list_activities(
@@ -437,6 +681,9 @@ async fn post_wallets_activity(
             }),
         ));
     }
+    let to_ts = body.to_ts.unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let from_ts = body.from_ts;
+
     if addresses.len() > state.config.max_batch_addresses {
         let job_id = Uuid::new_v4().to_string();
         let job_state = JobState {
@@ -453,121 +700,26 @@ async fn post_wallets_activity(
         let job_ref = Arc::new(RwLock::new(job_state));
         state.jobs.write().await.insert(job_id.clone(), job_ref.clone());
 
-        let config = state.config.clone();
-        let path = state.config.duckdb_path.clone();
-        let rate_limiter = state.rate_limiter.clone();
-        let client = state.client.clone();
-        let from_ts = body.from_ts;
-        let to_ts = body.to_ts.unwrap_or_else(|| chrono::Utc::now().timestamp());
-        let limit = body.limit;
-        let force_refresh = body.force_refresh;
-        let db_write_lock = state.db_write_lock.clone();
-        tokio::spawn(async move {
-            let mut out = Vec::with_capacity(addresses.len());
-            // 整个写库阶段持有一把锁，避免与其它请求的写操作交错导致 DuckDB Invalid bitmask
-            let _guard = db_write_lock.lock().await;
-            for (i, addr) in addresses.iter().enumerate() {
-                if force_refresh {
-                    let _ = db::delete_activities_for_address(&path, addr);
-                    if let Err(e) = sync::sync_range(
-                        &config,
-                        &path,
-                        rate_limiter.as_ref(),
-                        &client,
-                        addr,
-                        0,
-                        to_ts,
-                    )
-                    .await
-                    {
-                        let mut j = job_ref.write().await;
-                        j.status = JobStatus::Failed;
-                        j.error = Some(e);
-                        return;
-                    }
-                } else if let Err(e) = sync::sync_range(
-                    &config,
-                    &path,
-                    rate_limiter.as_ref(),
-                    &client,
-                    addr,
-                    from_ts,
-                    to_ts,
+        state
+            .write_job_tx
+            .send(WriteJob::BatchActivity {
+                job_id: job_id.clone(),
+                addresses: addresses.clone(),
+                from_ts,
+                to_ts,
+                limit: body.limit,
+                force_refresh: body.force_refresh,
+            })
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        code: "QUEUE_FULL".into(),
+                        message: "write worker unavailable".into(),
+                    }),
                 )
-                .await
-                {
-                    let mut j = job_ref.write().await;
-                    j.status = JobStatus::Failed;
-                    j.error = Some(e);
-                    return;
-                }
-                let mut j = job_ref.write().await;
-                j.completed = i + 1;
-                j.status = JobStatus::Running;
-
-                let (rows, total) =
-                    db::list_activities(&path, addr, from_ts, to_ts, limit, None).unwrap_or((vec![], 0));
-                let need_fallback = rows.iter().any(|r| r.type_.eq_ignore_ascii_case("REDEEM") && r.effective_share.is_none());
-                let eff_ts = rows.iter().map(|r| r.ts).max().unwrap_or(to_ts);
-                let effective_redeem = if need_fallback {
-                    effective_redeem_share_map(&path, addr, eff_ts)
-                } else {
-                    HashMap::new()
-                };
-                let d: Vec<ActivityItemCompact> = rows
-                    .into_iter()
-                    .map(|r| {
-                        let share = if r.type_.eq_ignore_ascii_case("REDEEM") {
-                            r.effective_share
-                                .or_else(|| {
-                                    effective_redeem.get(&(
-                                        r.ts,
-                                        r.transaction_hash.clone(),
-                                        r.condition_id.clone(),
-                                        r.token_id.clone(),
-                                    )).copied()
-                                })
-                                .or(r.share)
-                        } else {
-                            r.share
-                        };
-                        ActivityItemCompact {
-                            ts: r.ts,
-                            type_: r.type_,
-                            share,
-                            price: r.price,
-                            title: r.title,
-                            outcome: r.outcome,
-                            condition_id: r.condition_id,
-                            token_id: r.token_id,
-                            transaction_hash: r.transaction_hash,
-                        }
-                    })
-                    .collect();
-                let from_time = d.iter().map(|x| x.ts).min().and_then(|ts| {
-                    chrono::DateTime::from_timestamp(ts, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                });
-                let to_time = d.iter().map(|x| x.ts).max().and_then(|ts| {
-                    chrono::DateTime::from_timestamp(ts, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                });
-                out.push(WalletActivityItem {
-                    address: addr.clone(),
-                    total,
-                    from_time,
-                    to_time,
-                    data: d,
-                });
-            }
-            let response = BatchActivityResponse { data: out };
-            if let Ok(v) = serde_json::to_value(&response) {
-                let mut j = job_ref.write().await;
-                j.result = Some(v);
-                j.status = JobStatus::Done;
-                j.message = None;
-            }
-        });
+            })?;
 
         return Ok((
             StatusCode::ACCEPTED,
@@ -580,47 +732,34 @@ async fn post_wallets_activity(
             .into_response());
     }
 
-    let to_ts = body.to_ts.unwrap_or_else(|| chrono::Utc::now().timestamp());
     let path = &state.config.duckdb_path;
-    let mut out = Vec::with_capacity(body.addresses.len());
-    for address in &body.addresses {
-        let addr = address.trim().to_lowercase();
-        if addr.is_empty() || !addr.starts_with("0x") {
-            continue;
-        }
-        let _guard = state.db_write_lock.lock().await;
-        if body.force_refresh {
-            let _ = db::delete_activities_for_address(path, &addr);
-            if let Err(e) = sync::sync_range(
-                &state.config,
-                path,
-                state.rate_limiter.as_ref(),
-                &state.client,
-                &addr,
-                0,
-                to_ts,
-            )
-            .await
-            {
-                tracing::warn!(address = %addr, err = %e, "batch force_refresh sync failed");
-            }
-        } else if let Err(e) = sync::sync_range(
-            &state.config,
-            path,
-            state.rate_limiter.as_ref(),
-            &state.client,
-            &addr,
-            body.from_ts,
-            to_ts,
-        )
+    let items: Vec<(String, i64, i64, bool)> = addresses
+        .iter()
+        .map(|a| (a.clone(), from_ts, to_ts, body.force_refresh))
+        .collect();
+    let (tx, rx) = oneshot::channel();
+    state
+        .write_job_tx
+        .send(WriteJob::SyncMany { items, respond: tx })
         .await
-        {
-            tracing::warn!(address = %addr, err = %e, "batch sync failed");
-        }
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody {
+                    code: "QUEUE_FULL".into(),
+                    message: "write worker unavailable".into(),
+                }),
+            )
+        })?;
+    if let Ok(Err(e)) = rx.await {
+        tracing::warn!(err = %e, "batch sync failed");
+    }
+    let mut out = Vec::with_capacity(addresses.len());
+    for addr in &addresses {
         let (rows, total) = db::list_activities(
             path,
-            &addr,
-            body.from_ts,
+            addr,
+            from_ts,
             to_ts,
             body.limit,
             None,
@@ -671,7 +810,7 @@ async fn post_wallets_activity(
             chrono::DateTime::from_timestamp(ts, 0).map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         });
         out.push(WalletActivityItem {
-            address: addr,
+            address: addr.clone(),
             total,
             from_time,
             to_time,
@@ -765,66 +904,24 @@ async fn get_daily_stats(
         let job_ref = Arc::new(RwLock::new(job_state));
         state.jobs.write().await.insert(job_id.clone(), job_ref.clone());
 
-        let config = state.config.clone();
-        let path = state.config.duckdb_path.clone();
-        let rate_limiter = state.rate_limiter.clone();
-        let client = state.client.clone();
-        let addrs = addresses.clone();
-        let db_write_lock = state.db_write_lock.clone();
-        tokio::spawn(async move {
-            let sync_to_ts = end_of_yesterday_ts();
-            let from_ts = 0i64;
-            // 整个写库阶段持有一把锁，避免与其它请求的写操作交错导致 DuckDB Invalid bitmask
-            {
-                let _guard = db_write_lock.lock().await;
-                for (i, addr) in addrs.iter().enumerate() {
-                    if let Err(e) = sync::sync_range(
-                        &config,
-                        &path,
-                        rate_limiter.as_ref(),
-                        &client,
-                        addr,
-                        0,
-                        sync_to_ts,
-                    )
-                    .await
-                    {
-                        let mut j = job_ref.write().await;
-                        j.status = JobStatus::Failed;
-                        j.error = Some(e);
-                        return;
-                    }
-                    let mut j = job_ref.write().await;
-                    j.completed = i + 1;
-                    j.status = JobStatus::Running;
-                }
-            }
-            let mut data = Vec::with_capacity(addrs.len());
-            for addr in &addrs {
-                let activities =
-                    db::list_activities_in_range(&path, addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
-                let daily = valuation::compute_daily_volume_and_realized_pnl(&activities, &from_date, &to_date);
-                let daily_points: Vec<DailyStatsPoint> = daily
-                    .into_iter()
-                    .map(|(date, volume, profit)| DailyStatsPoint {
-                        date,
-                        volume,
-                        profit,
-                    })
-                    .collect();
-                data.push(WalletDailyStats {
-                    wallet: addr.clone(),
-                    daily: daily_points,
-                });
-            }
-            let response = DailyStatsResponse { data };
-            if let Ok(v) = serde_json::to_value(&response) {
-                let mut j = job_ref.write().await;
-                j.result = Some(v);
-                j.status = JobStatus::Done;
-                j.message = None;
-            }
-        });
+        state
+            .write_job_tx
+            .send(WriteJob::BatchDailyStats {
+                job_id: job_id.clone(),
+                addresses: addresses.clone(),
+                from_date: from_date.clone(),
+                to_date: to_date.clone(),
+            })
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        code: "QUEUE_FULL".into(),
+                        message: "write worker unavailable".into(),
+                    }),
+                )
+            })?;
 
         return Ok((
             StatusCode::ACCEPTED,
@@ -845,31 +942,41 @@ async fn get_daily_stats(
         .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-    // 先按「截止到前一天」同步基础数据，再读库算统计；写库串行化避免 DuckDB 并发写错误
-    let sync_to_ts = end_of_yesterday_ts();
-    let _guard = state.db_write_lock.lock().await;
-    for addr in &addresses {
-        if let Err(e) = sync::sync_range(
-            &state.config,
-            path,
-            state.rate_limiter.as_ref(),
-            &state.client,
-            addr,
-            0,
-            sync_to_ts,
-        )
+    let (tx, rx) = oneshot::channel();
+    state
+        .write_job_tx
+        .send(WriteJob::SyncManyUntilYesterday {
+            items: addresses.clone(),
+            respond: tx,
+        })
         .await
-        {
-            tracing::warn!(address = %addr, err = %e, "daily-stats: sync up to yesterday failed");
-            return Err((
+        .map_err(|_| {
+            (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorBody {
-                    code: "SYNC_ERROR".into(),
-                    message: e,
+                    code: "QUEUE_FULL".into(),
+                    message: "write worker unavailable".into(),
                 }),
-            ));
-        }
-    }
+            )
+        })?;
+    let sync_ok = rx.await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                code: "SYNC_ERROR".into(),
+                message: "write worker dropped".into(),
+            }),
+        )
+    })?;
+    sync_ok.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                code: "SYNC_ERROR".into(),
+                message: e,
+            }),
+        )
+    })?;
 
     let mut data = Vec::with_capacity(addresses.len());
     for addr in addresses {
@@ -946,63 +1053,24 @@ async fn post_daily_stats(
         let job_ref = Arc::new(RwLock::new(job_state));
         state.jobs.write().await.insert(job_id.clone(), job_ref.clone());
 
-        let config = state.config.clone();
-        let rate_limiter = state.rate_limiter.clone();
-        let client = state.client.clone();
-        let db_write_lock = state.db_write_lock.clone();
-        tokio::spawn(async move {
-            let sync_to_ts = end_of_yesterday_ts();
-            // 整个写库阶段持有一把锁，避免与其它请求的写操作交错导致 DuckDB Invalid bitmask
-            {
-                let _guard = db_write_lock.lock().await;
-                for (i, addr) in addresses.iter().enumerate() {
-                    if let Err(e) = sync::sync_range(
-                        &config,
-                        &path,
-                        rate_limiter.as_ref(),
-                        &client,
-                        addr,
-                        0,
-                        sync_to_ts,
-                    )
-                    .await
-                    {
-                        let mut j = job_ref.write().await;
-                        j.status = JobStatus::Failed;
-                        j.error = Some(e);
-                        return;
-                    }
-                    let mut j = job_ref.write().await;
-                    j.completed = i + 1;
-                    j.status = JobStatus::Running;
-                }
-            }
-            let mut data = Vec::with_capacity(addresses.len());
-            for addr in &addresses {
-                let activities =
-                    db::list_activities_in_range(&path, addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
-                let daily = valuation::compute_daily_volume_and_realized_pnl(&activities, &from_date, &to_date);
-                let daily_points: Vec<DailyStatsPoint> = daily
-                    .into_iter()
-                    .map(|(date, volume, profit)| DailyStatsPoint {
-                        date,
-                        volume,
-                        profit,
-                    })
-                    .collect();
-                data.push(WalletDailyStats {
-                    wallet: addr.clone(),
-                    daily: daily_points,
-                });
-            }
-            let response = DailyStatsResponse { data };
-            if let Ok(v) = serde_json::to_value(&response) {
-                let mut j = job_ref.write().await;
-                j.result = Some(v);
-                j.status = JobStatus::Done;
-                j.message = None;
-            }
-        });
+        state
+            .write_job_tx
+            .send(WriteJob::BatchDailyStats {
+                job_id: job_id.clone(),
+                addresses: addresses.clone(),
+                from_date: from_date.clone(),
+                to_date: to_date.clone(),
+            })
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        code: "QUEUE_FULL".into(),
+                        message: "write worker unavailable".into(),
+                    }),
+                )
+            })?;
 
         return Ok((
             StatusCode::ACCEPTED,
@@ -1016,30 +1084,41 @@ async fn post_daily_stats(
     }
 
     let path = &state.config.duckdb_path;
-    let sync_to_ts = end_of_yesterday_ts();
-    let _guard = state.db_write_lock.lock().await;
-    for addr in &addresses {
-        if let Err(e) = sync::sync_range(
-            &state.config,
-            path,
-            state.rate_limiter.as_ref(),
-            &state.client,
-            addr,
-            0,
-            sync_to_ts,
-        )
+    let (tx, rx) = oneshot::channel();
+    state
+        .write_job_tx
+        .send(WriteJob::SyncManyUntilYesterday {
+            items: addresses.clone(),
+            respond: tx,
+        })
         .await
-        {
-            tracing::warn!(address = %addr, err = %e, "daily-stats POST: sync up to yesterday failed");
-            return Err((
+        .map_err(|_| {
+            (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorBody {
-                    code: "SYNC_ERROR".into(),
-                    message: e,
+                    code: "QUEUE_FULL".into(),
+                    message: "write worker unavailable".into(),
                 }),
-            ));
-        }
-    }
+            )
+        })?;
+    let sync_ok = rx.await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                code: "SYNC_ERROR".into(),
+                message: "write worker dropped".into(),
+            }),
+        )
+    })?;
+    sync_ok.map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                code: "SYNC_ERROR".into(),
+                message: e,
+            }),
+        )
+    })?;
 
     let mut data = Vec::with_capacity(addresses.len());
     for addr in addresses {

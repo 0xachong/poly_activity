@@ -1,7 +1,28 @@
 //! DuckDB 存储：activities 表、open_positions 表及读写
 
 use duckdb::{params, Connection, Result};
+use fs4::FileExt;
 use std::path::Path;
+
+/// 跨进程写锁：打开 path.lock 并加排他锁，返回的 File 在 drop 时自动解锁。
+/// 多实例写同一 DuckDB 文件时必须串行，仅进程内 Mutex 不够。
+/// 供 sync 层在整段 sync_range 内持有一把锁时使用，减少锁竞争。
+pub(crate) fn open_write_lock(path: &str) -> std::io::Result<std::fs::File> {
+    let lock_path = format!("{}.lock", path);
+    if let Some(p) = Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+    f.lock_exclusive()?;
+    Ok(f)
+}
+
+fn io_to_duckdb(e: std::io::Error) -> duckdb::Error {
+    duckdb::Error::ToSqlConversionFailure(Box::new(e))
+}
 
 /// 单条 Activity 记录（与表结构一致）
 #[derive(Clone, Debug)]
@@ -41,6 +62,7 @@ fn open(path: &str) -> Result<Connection> {
 
 /// 初始化 schema：activities 表、open_positions 表
 pub fn init_schema(path: &str) -> Result<()> {
+    let _guard = open_write_lock(path).map_err(io_to_duckdb)?;
     let conn = open(path)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS activities (
@@ -95,6 +117,7 @@ pub fn get_ts_range(path: &str, address: &str) -> Result<Option<(i64, i64)>> {
 
 /// 删除该地址下全部 activities 及 open_positions（用于 force_refresh 时清空后重拉）
 pub fn delete_activities_for_address(path: &str, address: &str) -> Result<u64> {
+    let _guard = open_write_lock(path).map_err(io_to_duckdb)?;
     let conn = open(path)?;
     let addr = address.to_lowercase();
     let _ = conn.execute("DELETE FROM open_positions WHERE address = ?", [&addr])?;
@@ -102,17 +125,18 @@ pub fn delete_activities_for_address(path: &str, address: &str) -> Result<u64> {
     Ok(n as u64)
 }
 
-/// 批量写入 Activity，唯一冲突则更新
-pub fn insert_activities_batch(path: &str, rows: &[ActivityRow]) -> Result<()> {
+fn ts_to_utc_str(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_default()
+}
+
+/// 批量写入 Activity（内部实现，不加锁）。调用方需已持有 open_write_lock 或仅单写场景使用。
+fn insert_activities_batch_impl(path: &str, rows: &[ActivityRow]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
     let conn = open(path)?;
-    fn ts_to_utc_str(ts: i64) -> String {
-        chrono::DateTime::from_timestamp(ts, 0)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_default()
-    }
     for r in rows {
         let addr = r.address.to_lowercase();
         let cond_id = r.condition_id.as_deref().unwrap_or("");
@@ -147,6 +171,17 @@ pub fn insert_activities_batch(path: &str, rows: &[ActivityRow]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// 批量写入 Activity，唯一冲突则更新
+pub fn insert_activities_batch(path: &str, rows: &[ActivityRow]) -> Result<()> {
+    let _guard = open_write_lock(path).map_err(io_to_duckdb)?;
+    insert_activities_batch_impl(path, rows)
+}
+
+/// 批量写入 Activity（不加锁）。仅当调用方已持有 open_write_lock 时使用，如 sync_range 内。
+pub(crate) fn insert_activities_batch_unlocked(path: &str, rows: &[ActivityRow]) -> Result<()> {
+    insert_activities_batch_impl(path, rows)
 }
 
 /// 按时间区间查询：ts 在 [from_ts, to_ts]，按 ts 倒序，最多 limit 条；type_filter 为空则不过滤
@@ -230,8 +265,8 @@ pub fn list_activities_in_range(
     Ok(rows)
 }
 
-/// 更新一批 REDEEM 行的 effective_share（由同步后重算写入）。key 为 (transaction_hash, condition_id, token_id)，空用 ""。
-pub fn update_effective_share_for_redeems(
+/// 更新一批 REDEEM 行的 effective_share（内部实现，不加锁）。
+fn update_effective_share_for_redeems_impl(
     path: &str,
     address: &str,
     updates: &[(&str, &str, &str, f64)],
@@ -248,6 +283,25 @@ pub fn update_effective_share_for_redeems(
         )?;
     }
     Ok(())
+}
+
+/// 更新一批 REDEEM 行的 effective_share（由同步后重算写入）。key 为 (transaction_hash, condition_id, token_id)，空用 ""。
+pub fn update_effective_share_for_redeems(
+    path: &str,
+    address: &str,
+    updates: &[(&str, &str, &str, f64)],
+) -> Result<()> {
+    let _guard = open_write_lock(path).map_err(io_to_duckdb)?;
+    update_effective_share_for_redeems_impl(path, address, updates)
+}
+
+/// 更新一批 REDEEM 行的 effective_share（不加锁）。仅当调用方已持有 open_write_lock 时使用。
+pub(crate) fn update_effective_share_for_redeems_unlocked(
+    path: &str,
+    address: &str,
+    updates: &[(&str, &str, &str, f64)],
+) -> Result<()> {
+    update_effective_share_for_redeems_impl(path, address, updates)
 }
 
 /// 查询该地址当前未平仓 token 列表
@@ -270,8 +324,8 @@ pub fn list_open_positions(path: &str, address: &str) -> Result<Vec<OpenPosition
     Ok(rows)
 }
 
-/// 替换该地址的未平仓列表（同步后重算：先删后插）
-pub fn replace_open_positions(
+/// 替换该地址的未平仓列表（内部实现，不加锁）。
+fn replace_open_positions_impl(
     path: &str,
     address: &str,
     positions: &[(String, String, f64)],
@@ -289,4 +343,23 @@ pub fn replace_open_positions(
         )?;
     }
     Ok(())
+}
+
+/// 替换该地址的未平仓列表（同步后重算：先删后插）
+pub fn replace_open_positions(
+    path: &str,
+    address: &str,
+    positions: &[(String, String, f64)],
+) -> Result<()> {
+    let _guard = open_write_lock(path).map_err(io_to_duckdb)?;
+    replace_open_positions_impl(path, address, positions)
+}
+
+/// 替换该地址的未平仓列表（不加锁）。仅当调用方已持有 open_write_lock 时使用。
+pub(crate) fn replace_open_positions_unlocked(
+    path: &str,
+    address: &str,
+    positions: &[(String, String, f64)],
+) -> Result<()> {
+    replace_open_positions_impl(path, address, positions)
 }

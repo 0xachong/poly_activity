@@ -10,9 +10,9 @@ mod positions;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
-use api::{router, AppState};
+use api::{router, run_write_worker, AppState};
 use config::Config;
 use rate_limit::RateLimiter;
 use tower_http::cors::{Any, CorsLayer};
@@ -37,13 +37,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .user_agent("poly_activity/1.0")
         .build()?;
 
+    let (write_job_tx, write_job_rx) = mpsc::channel(256);
     let state = Arc::new(AppState {
         config: config.clone(),
         rate_limiter,
         client,
         jobs: Arc::new(RwLock::new(HashMap::new())),
-        db_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        write_job_tx,
     });
+    tokio::spawn(run_write_worker(write_job_rx, state.clone()));
 
     let app = router(state).layer(
         CorsLayer::new()
