@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .user_agent("poly_activity/1.0")
         .build()?;
 
-    let (write_job_tx, write_job_rx) = mpsc::channel(256);
+    let (write_job_tx, write_job_rx) = mpsc::channel(1024);
     let state = Arc::new(AppState {
         config: config.clone(),
         rate_limiter,
