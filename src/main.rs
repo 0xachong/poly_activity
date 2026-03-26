@@ -18,6 +18,22 @@ use rate_limit::RateLimiter;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+/// 尝试抢占「单写实例」leader 锁（非阻塞）。成功则返回持锁的 File，进程需长期持有；失败则返回 None。
+fn try_acquire_leader_lock(duckdb_path: &str) -> Option<std::fs::File> {
+    use fs4::FileExt;
+    let leader_path = format!("{}.leader", duckdb_path);
+    if let Some(p) = std::path::Path::new(duckdb_path).parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&leader_path)
+        .ok()?;
+    f.try_lock_exclusive().ok()?;
+    Some(f)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -39,14 +55,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let (write_job_tx, write_job_rx) = mpsc::channel(1024);
+    let (is_write_leader, _leader_lock_file) = if config.single_writer {
+        match try_acquire_leader_lock(&config.duckdb_path) {
+            Some(f) => {
+                tracing::info!("single_writer: acquired leader lock, this instance is the sole writer");
+                (true, Some(f))
+            }
+            None => {
+                tracing::info!("single_writer: leader lock held by another instance, this instance is read-only for writes");
+                (false, None)
+            }
+        }
+    } else {
+        (true, None)
+    };
+
+    // 非写主实例：强制所有 DuckDB 连接以只读方式打开，避免多进程对同一文件以 RW 打开造成元数据一致性问题。
+    if !is_write_leader {
+        std::env::set_var("POLY_ACTIVITY_DB_READ_ONLY", "1");
+    }
+
     let state = Arc::new(AppState {
         config: config.clone(),
         rate_limiter,
         client,
         jobs: Arc::new(RwLock::new(HashMap::new())),
         write_job_tx,
+        worker_current_job_id: Arc::new(RwLock::new(None)),
+        is_write_leader,
+        _leader_lock_file,
     });
-    tokio::spawn(run_write_worker(write_job_rx, state.clone()));
+
+    if is_write_leader {
+        tokio::spawn(run_write_worker(write_job_rx, state.clone()));
+    }
 
     let app = router(state)
         .layer(

@@ -10,7 +10,8 @@ use axum::body::Body;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -76,6 +77,7 @@ pub async fn run_write_worker(mut job_rx: mpsc::Receiver<WriteJob>, state: Arc<A
                 force_refresh,
                 respond,
             } => {
+                tracing::info!(job = "sync_one", address = %address, "worker: start");
                 let addr = address.to_lowercase();
                 let result = if force_refresh {
                     let _ = db::delete_activities_for_address(path, &addr);
@@ -86,6 +88,7 @@ pub async fn run_write_worker(mut job_rx: mpsc::Receiver<WriteJob>, state: Arc<A
                 let _ = respond.send(result);
             }
             WriteJob::SyncMany { items, respond } => {
+                tracing::info!(job = "sync_many", n = items.len(), "worker: start");
                 let mut first_err: Option<String> = None;
                 for (addr, from_ts, to_ts, force_refresh) in items {
                     let res = if force_refresh {
@@ -102,6 +105,7 @@ pub async fn run_write_worker(mut job_rx: mpsc::Receiver<WriteJob>, state: Arc<A
                 let _ = respond.send(first_err.map_or(Ok(()), Err));
             }
             WriteJob::SyncManyUntilYesterday { items, respond } => {
+                tracing::info!(job = "sync_many_yesterday", n = items.len(), "worker: start");
                 let sync_to_ts = end_of_yesterday_ts();
                 let mut first_err: Option<String> = None;
                 for addr in items {
@@ -122,56 +126,163 @@ pub async fn run_write_worker(mut job_rx: mpsc::Receiver<WriteJob>, state: Arc<A
                 limit,
                 force_refresh,
             } => {
+                tracing::info!(job_id = %job_id, kind = "activity", total = addresses.len(), "worker: start job");
+                *state.worker_current_job_id.write().await = Some(job_id.clone());
                 let job_ref = match state.jobs.read().await.get(&job_id).cloned() {
                     Some(r) => r,
-                    None => continue,
+                    None => {
+                        *state.worker_current_job_id.write().await = None;
+                        continue;
+                    }
                 };
-                // 整批任务持有一把跨进程文件锁，避免与其它进程在地址边界交错写导致 DuckDB Invalid bitmask
-                let _db_guard = match db::open_write_lock(path) {
-                    Ok(f) => f,
+
+                // Phase 1（可选）：force_refresh → 短暂加锁删除所有地址的旧数据
+                if force_refresh {
+                    match db::open_write_lock(path) {
+                        Ok(_db_guard) => {
+                            for addr in &addresses {
+                                let _ = db::delete_activities_for_address_unlocked(path, addr);
+                            }
+                        }
+                        Err(e) => {
+                            let mut j = job_ref.write().await;
+                            j.status = JobStatus::Failed;
+                            j.error = Some(e.to_string());
+                            *state.worker_current_job_id.write().await = None;
+                            continue;
+                        }
+                    }
+                }
+
+                // Phase 2：并发 fetch 所有地址（无锁），JoinSet + Semaphore 控制并发
+                {
+                    let mut j = job_ref.write().await;
+                    j.message = Some("拉取数据中…".to_string());
+                }
+                let sem = Arc::new(Semaphore::new(config.fetch_concurrency));
+                let mut join_set: JoinSet<Result<(String, Vec<db::ActivityRow>), String>> = JoinSet::new();
+                for addr in addresses.iter().cloned() {
+                    let state2 = state.clone();
+                    let sem2 = sem.clone();
+                    let fetch_from = if force_refresh { 0 } else { from_ts };
+                    join_set.spawn(async move {
+                        let _permit = sem2.acquire().await.expect("semaphore closed");
+                        let rows = sync::sync_range_fetch_only(
+                            &state2.config,
+                            &state2.config.duckdb_path,
+                            &state2.rate_limiter,
+                            &state2.client,
+                            &addr,
+                            fetch_from,
+                            to_ts,
+                        )
+                        .await?;
+                        Ok((addr, rows))
+                    });
+                }
+
+                // 收集 fetch 结果，按地址存储
+                let mut fetched: HashMap<String, Vec<db::ActivityRow>> = HashMap::with_capacity(addresses.len());
+                let mut fetch_failed = false;
+                let mut completed_count = 0usize;
+                while let Some(result) = join_set.join_next().await {
+                    match result {
+                        Ok(Ok((addr, rows))) => {
+                            fetched.insert(addr, rows);
+                            completed_count += 1;
+                            let mut j = job_ref.write().await;
+                            j.completed = completed_count;
+                            j.status = JobStatus::Running;
+                        }
+                        Ok(Err(e)) => {
+                            let mut j = job_ref.write().await;
+                            j.status = JobStatus::Failed;
+                            j.error = Some(e);
+                            fetch_failed = true;
+                            break; // JoinSet drop 时自动取消剩余 task
+                        }
+                        Err(e) => {
+                            let mut j = job_ref.write().await;
+                            j.status = JobStatus::Failed;
+                            j.error = Some(format!("task panicked: {}", e));
+                            fetch_failed = true;
+                            break;
+                        }
+                    }
+                }
+                if fetch_failed {
+                    *state.worker_current_job_id.write().await = None;
+                    tracing::info!(job_id = %job_id, "worker: done job (fetch failed)");
+                    continue;
+                }
+
+                // Phase 3：仅当有新数据时加锁写库
+                let has_new_data: bool = fetched.values().any(|rows| !rows.is_empty());
+                if has_new_data {
+                    tracing::info!(job_id = %job_id, "worker: acquiring db lock for write phase");
+                    let _db_guard = match db::open_write_lock(path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let mut j = job_ref.write().await;
+                            j.status = JobStatus::Failed;
+                            j.error = Some(e.to_string());
+                            *state.worker_current_job_id.write().await = None;
+                            continue;
+                        }
+                    };
+                    {
+                        let mut j = job_ref.write().await;
+                        j.message = Some("写库中…".to_string());
+                        j.completed = 0;
+                    }
+                    let mut write_failed = false;
+                    let mut write_count = 0usize;
+                    for addr in addresses.iter() {
+                        let rows = fetched.get(addr).map(|v| v.as_slice()).unwrap_or(&[]);
+                        if let Err(e) = sync::write_and_recompute_unlocked(path, addr, rows) {
+                            let mut j = job_ref.write().await;
+                            j.status = JobStatus::Failed;
+                            j.error = Some(e);
+                            write_failed = true;
+                            break;
+                        }
+                        if !rows.is_empty() {
+                            write_count += 1;
+                            let mut j = job_ref.write().await;
+                            j.completed = write_count;
+                        }
+                    }
+                    if write_failed {
+                        *state.worker_current_job_id.write().await = None;
+                        tracing::info!(job_id = %job_id, "worker: done job (write failed)");
+                        continue;
+                    }
+                }
+
+                // 读库构建响应（单连接复用）
+                let read_conn = match db::open_conn(path) {
+                    Ok(c) => c,
                     Err(e) => {
                         let mut j = job_ref.write().await;
                         j.status = JobStatus::Failed;
                         j.error = Some(e.to_string());
+                        *state.worker_current_job_id.write().await = None;
                         continue;
                     }
                 };
                 let mut out = Vec::with_capacity(addresses.len());
-                for (i, addr) in addresses.iter().enumerate() {
-                    if force_refresh {
-                        let _ = db::delete_activities_for_address(path, addr);
-                        if let Err(e) =
-                            sync::sync_range(config, path, rate_limiter, client, addr, 0, to_ts).await
-                        {
-                            let mut j = job_ref.write().await;
-                            j.status = JobStatus::Failed;
-                            j.error = Some(e);
-                            return;
-                        }
-                    } else if let Err(e) = sync::sync_range(config, path, rate_limiter, client, addr, from_ts, to_ts)
-                        .await
-                    {
-                        let mut j = job_ref.write().await;
-                        j.status = JobStatus::Failed;
-                        j.error = Some(e);
-                        return;
-                    }
-                    {
-                        let mut j = job_ref.write().await;
-                        j.completed = i + 1;
-                        j.status = JobStatus::Running;
-                    }
-                    let (rows, total) =
-                        db::list_activities(path, addr, from_ts, to_ts, limit, None).unwrap_or((vec![], 0));
+                for addr in &addresses {
+                    let (db_rows, total) =
+                        db::list_activities_conn(&read_conn, addr, from_ts, to_ts, limit, None).unwrap_or((vec![], 0));
                     let need_fallback =
-                        rows.iter().any(|r| r.type_.eq_ignore_ascii_case("REDEEM") && r.effective_share.is_none());
-                    let eff_ts = rows.iter().map(|r| r.ts).max().unwrap_or(to_ts);
+                        db_rows.iter().any(|r| r.type_.eq_ignore_ascii_case("REDEEM") && r.effective_share.is_none());
+                    let eff_ts = db_rows.iter().map(|r| r.ts).max().unwrap_or(to_ts);
                     let effective_redeem = if need_fallback {
                         effective_redeem_share_map(path, addr, eff_ts)
                     } else {
                         HashMap::new()
                     };
-                    let d: Vec<ActivityItemCompact> = rows
+                    let d: Vec<ActivityItemCompact> = db_rows
                         .into_iter()
                         .map(|r| {
                             let share = if r.type_.eq_ignore_ascii_case("REDEEM") {
@@ -223,6 +334,8 @@ pub async fn run_write_worker(mut job_rx: mpsc::Receiver<WriteJob>, state: Arc<A
                     j.status = JobStatus::Done;
                     j.message = None;
                 }
+                *state.worker_current_job_id.write().await = None;
+                tracing::info!(job_id = %job_id, "worker: done job");
             }
             WriteJob::BatchDailyStats {
                 job_id,
@@ -230,59 +343,187 @@ pub async fn run_write_worker(mut job_rx: mpsc::Receiver<WriteJob>, state: Arc<A
                 from_date,
                 to_date,
             } => {
+                tracing::info!(job_id = %job_id, kind = "daily_stats", total = addresses.len(), "worker: start job");
+                *state.worker_current_job_id.write().await = Some(job_id.clone());
                 let job_ref = match state.jobs.read().await.get(&job_id).cloned() {
                     Some(r) => r,
-                    None => continue,
+                    None => {
+                        *state.worker_current_job_id.write().await = None;
+                        continue;
+                    }
                 };
-                // 整批任务持有一把跨进程文件锁，避免与其它进程在地址边界交错写导致 DuckDB Invalid bitmask
-                let _db_guard = match db::open_write_lock(path) {
-                    Ok(f) => f,
+
+                let sync_to_ts = end_of_yesterday_ts();
+
+                // Phase 0：预检哪些地址需要 fetch（单连接批量查 range，跳过已同步地址）
+                let addrs_to_fetch: Vec<String> = match db::open_conn(path) {
+                    Ok(conn) => {
+                        let need: Vec<String> = addresses
+                            .iter()
+                            .filter(|addr| match db::get_ts_range_conn(&conn, addr) {
+                                Ok(Some((_min, max))) if max >= sync_to_ts => false,
+                                _ => true,
+                            })
+                            .cloned()
+                            .collect();
+                        tracing::info!(job_id = %job_id, total = addresses.len(), need_fetch = need.len(), "range pre-check done");
+                        need
+                    }
+                    Err(_) => addresses.clone(),
+                };
+
+                if !addrs_to_fetch.is_empty() {
+                    // Phase 1：并发 fetch 需要同步的地址（无锁）
+                    {
+                        let mut j = job_ref.write().await;
+                        j.message = Some(format!("拉取数据中（{}/{}需同步）…", addrs_to_fetch.len(), addresses.len()));
+                        j.status = JobStatus::Running;
+                    }
+                    let sem = Arc::new(Semaphore::new(config.fetch_concurrency));
+                    let mut join_set: JoinSet<Result<(String, Vec<db::ActivityRow>), String>> = JoinSet::new();
+                    for addr in addrs_to_fetch.iter().cloned() {
+                        let state2 = state.clone();
+                        let sem2 = sem.clone();
+                        join_set.spawn(async move {
+                            let _permit = sem2.acquire().await.expect("semaphore closed");
+                            let rows = sync::sync_range_fetch_only(
+                                &state2.config,
+                                &state2.config.duckdb_path,
+                                &state2.rate_limiter,
+                                &state2.client,
+                                &addr,
+                                0,
+                                sync_to_ts,
+                            )
+                            .await?;
+                            Ok((addr, rows))
+                        });
+                    }
+
+                    let mut fetched: HashMap<String, Vec<db::ActivityRow>> = HashMap::with_capacity(addrs_to_fetch.len());
+                    let mut fetch_failed = false;
+                    let mut completed_count = 0usize;
+                    while let Some(result) = join_set.join_next().await {
+                        match result {
+                            Ok(Ok((addr, rows))) => {
+                                fetched.insert(addr, rows);
+                                completed_count += 1;
+                                let mut j = job_ref.write().await;
+                                j.completed = completed_count;
+                            }
+                            Ok(Err(e)) => {
+                                let mut j = job_ref.write().await;
+                                j.status = JobStatus::Failed;
+                                j.error = Some(e);
+                                fetch_failed = true;
+                                break;
+                            }
+                            Err(e) => {
+                                let mut j = job_ref.write().await;
+                                j.status = JobStatus::Failed;
+                                j.error = Some(format!("task panicked: {}", e));
+                                fetch_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if fetch_failed {
+                        *state.worker_current_job_id.write().await = None;
+                        tracing::info!(job_id = %job_id, "worker: done job (fetch failed)");
+                        continue;
+                    }
+
+                    // Phase 2：加锁 → 仅写有新数据的地址 → 释放锁
+                    let has_new_data: bool = fetched.values().any(|rows| !rows.is_empty());
+                    if has_new_data {
+                        tracing::info!(job_id = %job_id, "worker: acquiring db lock for write phase");
+                        let _db_guard = match db::open_write_lock(path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                let mut j = job_ref.write().await;
+                                j.status = JobStatus::Failed;
+                                j.error = Some(e.to_string());
+                                *state.worker_current_job_id.write().await = None;
+                                continue;
+                            }
+                        };
+                        {
+                            let mut j = job_ref.write().await;
+                            j.message = Some("写库中…".to_string());
+                            j.completed = 0;
+                        }
+                        let mut write_failed = false;
+                        let mut write_count = 0usize;
+                        for addr in addrs_to_fetch.iter() {
+                            let rows = fetched.get(addr).map(|v| v.as_slice()).unwrap_or(&[]);
+                            if let Err(e) = sync::write_and_recompute_unlocked(path, addr, rows) {
+                                let mut j = job_ref.write().await;
+                                j.status = JobStatus::Failed;
+                                j.error = Some(e);
+                                write_failed = true;
+                                break;
+                            }
+                            write_count += 1;
+                            let mut j = job_ref.write().await;
+                            j.completed = write_count;
+                        }
+                        if write_failed {
+                            *state.worker_current_job_id.write().await = None;
+                            tracing::info!(job_id = %job_id, "worker: done job (write failed)");
+                            continue;
+                        }
+                    }
+                } else {
+                    tracing::info!(job_id = %job_id, "all addresses already synced, skipping fetch+write");
+                }
+
+                // Phase 3：单连接逐地址——缓存命中直接读，未命中则计算+写缓存
+                {
+                    let mut j = job_ref.write().await;
+                    j.message = Some("计算每日统计中…".to_string());
+                    j.completed = 0;
+                }
+                let mut data = Vec::with_capacity(addresses.len());
+                let compute_result = db::open_conn(path);
+                match compute_result {
+                    Ok(conn) => {
+                        for (i, addr) in addresses.iter().enumerate() {
+                            let max_ts = db::get_ts_range_conn(&conn, addr)
+                                .ok()
+                                .flatten()
+                                .map(|(_, m)| m)
+                                .unwrap_or(0);
+                            let daily = if db::is_daily_cache_valid_conn(&conn, addr, max_ts) {
+                                let cached = db::read_daily_stats_cache_conn(&conn, addr, &from_date, &to_date).unwrap_or_default();
+                                fill_daily_stats_from_cache(&cached, &from_date, &to_date)
+                            } else {
+                                compute_and_cache_daily_stats(&conn, addr, &from_date, &to_date)
+                            };
+                            let daily_points: Vec<DailyStatsPoint> = daily
+                                .into_iter()
+                                .map(|(date, volume, profit)| DailyStatsPoint {
+                                    date,
+                                    volume,
+                                    profit,
+                                })
+                                .collect();
+                            data.push(WalletDailyStats {
+                                wallet: addr.clone(),
+                                daily: daily_points,
+                            });
+                            if (i + 1) % 20 == 0 || i + 1 == addresses.len() {
+                                let mut j = job_ref.write().await;
+                                j.completed = i + 1;
+                            }
+                        }
+                    }
                     Err(e) => {
                         let mut j = job_ref.write().await;
                         j.status = JobStatus::Failed;
                         j.error = Some(e.to_string());
+                        *state.worker_current_job_id.write().await = None;
                         continue;
                     }
-                };
-                let sync_to_ts = end_of_yesterday_ts();
-                let from_ts = 0i64;
-                let to_ts = chrono::NaiveDate::parse_from_str(to_date.trim(), "%Y-%m-%d")
-                    .ok()
-                    .and_then(|d| d.and_hms_opt(23, 59, 59))
-                    .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
-                    .unwrap_or_else(|| chrono::Utc::now().timestamp());
-
-                for (i, addr) in addresses.iter().enumerate() {
-                    if let Err(e) =
-                        sync::sync_range(config, path, rate_limiter, client, addr, 0, sync_to_ts).await
-                    {
-                        let mut j = job_ref.write().await;
-                        j.status = JobStatus::Failed;
-                        j.error = Some(e);
-                        return;
-                    }
-                    let mut j = job_ref.write().await;
-                    j.completed = i + 1;
-                    j.status = JobStatus::Running;
-                }
-                let mut data = Vec::with_capacity(addresses.len());
-                for addr in &addresses {
-                    let activities =
-                        db::list_activities_in_range(path, addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
-                    let daily =
-                        valuation::compute_daily_volume_and_realized_pnl(&activities, &from_date, &to_date);
-                    let daily_points: Vec<DailyStatsPoint> = daily
-                        .into_iter()
-                        .map(|(date, volume, profit)| DailyStatsPoint {
-                            date,
-                            volume,
-                            profit,
-                        })
-                        .collect();
-                    data.push(WalletDailyStats {
-                        wallet: addr.clone(),
-                        daily: daily_points,
-                    });
                 }
                 let response = DailyStatsResponse { data };
                 if let Ok(v) = serde_json::to_value(&response) {
@@ -291,6 +532,8 @@ pub async fn run_write_worker(mut job_rx: mpsc::Receiver<WriteJob>, state: Arc<A
                     j.status = JobStatus::Done;
                     j.message = None;
                 }
+                *state.worker_current_job_id.write().await = None;
+                tracing::info!(job_id = %job_id, "worker: done job");
             }
         }
     }
@@ -322,6 +565,16 @@ pub struct JobState {
     pub created_at: i64,
 }
 
+/// GET /jobs/:id 的响应：在 pending 时附带 worker 当前正在处理的任务 id，便于前端展示「排队中」
+#[derive(Serialize)]
+pub struct JobProgressResponse {
+    #[serde(flatten)]
+    pub job: JobState,
+    /// 当本任务 pending 时，若 worker 正在处理其他任务，则为此 id
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_busy_with: Option<String>,
+}
+
 pub struct AppState {
     pub config: Config,
     pub rate_limiter: Arc<RateLimiter>,
@@ -330,6 +583,13 @@ pub struct AppState {
     pub jobs: Arc<RwLock<HashMap<String, Arc<RwLock<JobState>>>>>,
     /// 写任务队列：所有写库操作由此 channel 入队，由 run_write_worker 串行执行，无锁
     pub write_job_tx: mpsc::Sender<WriteJob>,
+    /// worker 当前正在处理的任务 id（仅批量任务），用于 pending 时提示「排队中，worker 正在处理 xxx」
+    pub worker_current_job_id: Arc<RwLock<Option<String>>>,
+    /// 单写实例模式下，仅 leader 为 true；非 leader 对写请求返回 503
+    pub is_write_leader: bool,
+    /// 持有 leader 锁的句柄，进程存活期间不释放，保证只有本实例是写主
+    #[allow(dead_code)]
+    pub _leader_lock_file: Option<std::fs::File>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -353,6 +613,81 @@ fn end_of_yesterday_ts() -> i64 {
     let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).date_naive();
     let end = yesterday.and_hms_opt(23, 59, 59).unwrap();
     chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(end, chrono::Utc).timestamp()
+}
+
+/// 从缓存条目 + 请求日期范围，补全零值日期，返回完整的 (date, volume, profit) 列表
+fn fill_daily_stats_from_cache(
+    cached: &[(String, f64, f64)],
+    from_date: &str,
+    to_date: &str,
+) -> Vec<(String, f64, f64)> {
+    let cache_map: HashMap<&str, (f64, f64)> = cached
+        .iter()
+        .map(|(d, v, p)| (d.as_str(), (*v, *p)))
+        .collect();
+    let from_naive = chrono::NaiveDate::parse_from_str(from_date, "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+    let to_naive = chrono::NaiveDate::parse_from_str(to_date, "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::NaiveDate::from_ymd_opt(2100, 12, 31).unwrap());
+    let mut out = Vec::new();
+    let mut current = from_naive;
+    while current <= to_naive {
+        let d = current.format("%Y-%m-%d").to_string();
+        let (vol, pnl) = cache_map.get(d.as_str()).copied().unwrap_or((0.0, 0.0));
+        out.push((d, vol, pnl));
+        current = current.succ_opt().unwrap_or(current);
+    }
+    out
+}
+
+/// 为单个地址计算每日统计并写入缓存。返回计算结果 (date, volume, profit)。
+/// conn 用于读 activities + 写缓存；调用方需确保可安全写库。
+fn compute_and_cache_daily_stats(
+    conn: &duckdb::Connection,
+    addr: &str,
+    from_date: &str,
+    to_date: &str,
+) -> Vec<(String, f64, f64)> {
+    let max_ts = db::get_ts_range_conn(conn, addr)
+        .ok()
+        .flatten()
+        .map(|(_, m)| m)
+        .unwrap_or(0);
+    let activities =
+        db::list_activities_in_range_conn(conn, addr, 0, max_ts, 5_000_000).unwrap_or_default();
+    // 用全量日期范围计算以覆盖所有有数据的日期
+    let first_date = activities
+        .first()
+        .map(|r| {
+            chrono::DateTime::from_timestamp(r.ts, 0)
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| from_date.to_string())
+        })
+        .unwrap_or_else(|| from_date.to_string());
+    let last_date = activities
+        .last()
+        .map(|r| {
+            chrono::DateTime::from_timestamp(r.ts, 0)
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| to_date.to_string())
+        })
+        .unwrap_or_else(|| to_date.to_string());
+    // 扩大范围确保覆盖请求范围
+    let wide_from = if first_date.as_str() < from_date { &first_date } else { from_date };
+    let wide_to = if last_date.as_str() > to_date { &last_date } else { to_date };
+    let daily = valuation::compute_daily_volume_and_realized_pnl(&activities, wide_from, wide_to);
+    // 缓存非零条目
+    let cache_data: Vec<(String, f64, f64)> = daily
+        .iter()
+        .filter(|(_, v, p)| *v != 0.0 || *p != 0.0)
+        .cloned()
+        .collect();
+    let _ = db::write_daily_stats_cache_conn(conn, addr, max_ts, &cache_data);
+    // 返回请求范围内的数据
+    daily
+        .into_iter()
+        .filter(|(d, _, _)| d.as_str() >= from_date && d.as_str() <= to_date)
+        .collect()
 }
 
 /// REDEEM 展示用：按历史持仓算出的有效份额。key = (ts, tx_hash, condition_id, token_id)
@@ -539,7 +874,7 @@ async fn get_open_positions(
 async fn get_job_progress(
     State(state): State<Arc<AppState>>,
     Path(job_id): Path<String>,
-) -> Result<Json<JobState>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Json<JobProgressResponse>, (StatusCode, Json<ErrorBody>)> {
     let jobs = state.jobs.read().await;
     let job_ref = jobs.get(&job_id).ok_or((
         StatusCode::NOT_FOUND,
@@ -549,7 +884,12 @@ async fn get_job_progress(
         }),
     ))?;
     let job = job_ref.read().await.clone();
-    Ok(Json(job))
+    let worker_busy_with = if matches!(job.status, JobStatus::Pending) {
+        state.worker_current_job_id.read().await.clone()
+    } else {
+        None
+    };
+    Ok(Json(JobProgressResponse { job, worker_busy_with }))
 }
 
 /// GET /wallets/:address/activity — 某钱包某段时间历史交易；force_refresh=true 时清空后从 Polymarket 重拉
@@ -574,6 +914,15 @@ async fn get_wallet_activity(
             Json(ErrorBody {
                 code: "BAD_REQUEST".into(),
                 message: "invalid address".into(),
+            }),
+        ));
+    }
+    if !state.is_write_leader {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                code: "NOT_WRITE_LEADER".into(),
+                message: "此实例非写主节点，请使用其他节点或稍后重试".into(),
             }),
         ));
     }
@@ -712,6 +1061,15 @@ async fn post_wallets_activity(
             Json(ErrorBody {
                 code: "BAD_REQUEST".into(),
                 message: "addresses required and must be valid 0x".into(),
+            }),
+        ));
+    }
+    if !state.is_write_leader {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                code: "NOT_WRITE_LEADER".into(),
+                message: "此实例非写主节点，请使用其他节点或稍后重试".into(),
             }),
         ));
     }
@@ -913,15 +1271,18 @@ async fn get_daily_stats(
             }),
         ));
     }
+    if !state.is_write_leader {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                code: "NOT_WRITE_LEADER".into(),
+                message: "此实例非写主节点，请使用其他节点或稍后重试".into(),
+            }),
+        ));
+    }
 
     let from_date = q.from_date.trim().to_string();
     let to_date = q.to_date.trim().to_string();
-    let to_ts = chrono::NaiveDate::parse_from_str(q.to_date.trim(), "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(23, 59, 59))
-        .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp());
-
     if addresses.len() > state.config.max_batch_addresses {
         let job_id = Uuid::new_v4().to_string();
         let job_state = JobState {
@@ -955,6 +1316,7 @@ async fn get_daily_stats(
                 5,
             ));
         }
+        tracing::info!(job_id = %job_id, kind = "daily_stats", total = addresses.len(), "enqueued job");
 
         return Ok((
             StatusCode::ACCEPTED,
@@ -968,64 +1330,66 @@ async fn get_daily_stats(
     }
 
     let path = &state.config.duckdb_path;
-    let from_ts = 0i64;
-    let to_ts = chrono::NaiveDate::parse_from_str(q.to_date.trim(), "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(23, 59, 59))
-        .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let sync_to_ts = end_of_yesterday_ts();
 
-    let (tx, rx) = oneshot::channel();
-    if state
-        .write_job_tx
-        .send(WriteJob::SyncManyUntilYesterday {
-            items: addresses.clone(),
-            respond: tx,
-        })
-        .await
-        .is_err()
-    {
-        return Ok(response_503_retry(
-            "WORKER_UNAVAILABLE",
-            "write worker unavailable, please retry after a few seconds",
-            5,
-        ));
-    }
-    let sync_ok = match rx.await {
-        Ok(ok) => ok,
-        Err(_) => {
-            return Ok(response_503_retry(
-                "WORKER_DROPPED",
-                "write worker dropped, please retry after a few seconds",
-                5,
-            ));
+    // Phase 0：预检——哪些地址需要 sync，哪些缓存有效（用完即关连接，避免与 write worker 冲突）
+    let (need_sync, need_compute, _cached_ok) = {
+        let conn = db::open_conn(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { code: "DB_ERROR".into(), message: e.to_string() })))?;
+        let mut ns: Vec<String> = Vec::new();
+        let mut nc: Vec<String> = Vec::new();
+        let mut co: Vec<String> = Vec::new();
+        for addr in &addresses {
+            match db::get_ts_range_conn(&conn, addr) {
+                Ok(Some((_min, max))) if max >= sync_to_ts => {
+                    if db::is_daily_cache_valid_conn(&conn, addr, max) {
+                        co.push(addr.clone());
+                    } else {
+                        nc.push(addr.clone());
+                    }
+                }
+                _ => { ns.push(addr.clone()); }
+            }
         }
-    };
-    if let Err(e) = sync_ok {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorBody {
-                code: "SYNC_ERROR".into(),
-                message: e,
-            }),
-        ));
+        tracing::info!(total = addresses.len(), cached = co.len(), need_compute = nc.len(), need_sync = ns.len(), "daily-stats pre-check");
+        (ns, nc, co)
+    }; // conn 在此 drop
+
+    // Phase 1：仅同步未同步的地址（通过 write worker）
+    if !need_sync.is_empty() {
+        let (tx, rx) = oneshot::channel();
+        if state.write_job_tx.send(WriteJob::SyncManyUntilYesterday { items: need_sync.clone(), respond: tx }).await.is_err() {
+            return Ok(response_503_retry("WORKER_UNAVAILABLE", "write worker unavailable, please retry after a few seconds", 5));
+        }
+        match rx.await {
+            Ok(Err(e)) => return Err((StatusCode::SERVICE_UNAVAILABLE, Json(ErrorBody { code: "SYNC_ERROR".into(), message: e }))),
+            Err(_) => return Ok(response_503_retry("WORKER_DROPPED", "write worker dropped, please retry after a few seconds", 5)),
+            _ => {}
+        }
     }
 
+    // Phase 2+3：sync 完成后重新开连接，计算未缓存地址 + 读缓存地址，统一构建响应
+    let compute_addrs: Vec<String> = need_sync.iter().chain(need_compute.iter()).cloned().collect();
+    let mut computed: HashMap<String, Vec<(String, f64, f64)>> = HashMap::new();
+    if !compute_addrs.is_empty() {
+        let _guard = db::open_write_lock(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { code: "DB_ERROR".into(), message: e.to_string() })))?;
+        let conn = db::open_conn(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { code: "DB_ERROR".into(), message: e.to_string() })))?;
+        for addr in &compute_addrs {
+            computed.insert(addr.clone(), compute_and_cache_daily_stats(&conn, addr, &from_date, &to_date));
+        }
+    }
+
+    let conn = db::open_conn(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { code: "DB_ERROR".into(), message: e.to_string() })))?;
     let mut data = Vec::with_capacity(addresses.len());
-    for addr in addresses {
-        let activities = db::list_activities_in_range(path, &addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
-        let daily = valuation::compute_daily_volume_and_realized_pnl(&activities, &from_date, &to_date);
-        let daily_points: Vec<DailyStatsPoint> = daily
-            .into_iter()
-            .map(|(date, volume, profit)| DailyStatsPoint {
-                date,
-                volume,
-                profit,
-            })
-            .collect();
+    for addr in &addresses {
+        let daily = if let Some(d) = computed.remove(addr) {
+            d
+        } else {
+            let cached = db::read_daily_stats_cache_conn(&conn, addr, &from_date, &to_date).unwrap_or_default();
+            fill_daily_stats_from_cache(&cached, &from_date, &to_date)
+        };
         data.push(WalletDailyStats {
-            wallet: addr,
-            daily: daily_points,
+            wallet: addr.clone(),
+            daily: daily.into_iter().map(|(date, volume, profit)| DailyStatsPoint { date, volume, profit }).collect(),
         });
     }
     Ok((StatusCode::OK, Json(DailyStatsResponse { data })).into_response())
@@ -1058,14 +1422,16 @@ async fn post_daily_stats(
             }),
         ));
     }
+    if !state.is_write_leader {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                code: "NOT_WRITE_LEADER".into(),
+                message: "此实例非写主节点，请使用其他节点或稍后重试".into(),
+            }),
+        ));
+    }
 
-    let path = state.config.duckdb_path.clone();
-    let from_ts = 0i64;
-    let to_ts = chrono::NaiveDate::parse_from_str(body.to_date.trim(), "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(23, 59, 59))
-        .map(|ndt| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc).timestamp())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp());
     let from_date = body.from_date.trim().to_string();
     let to_date = body.to_date.trim().to_string();
 
@@ -1103,6 +1469,7 @@ async fn post_daily_stats(
                 5,
             ));
         }
+        tracing::info!(job_id = %job_id, kind = "daily_stats", total = addresses.len(), "enqueued job");
 
         return Ok((
             StatusCode::ACCEPTED,
@@ -1116,56 +1483,85 @@ async fn post_daily_stats(
     }
 
     let path = &state.config.duckdb_path;
-    let (tx, rx) = oneshot::channel();
-    if state
-        .write_job_tx
-        .send(WriteJob::SyncManyUntilYesterday {
-            items: addresses.clone(),
-            respond: tx,
-        })
-        .await
-        .is_err()
-    {
-        return Ok(response_503_retry(
-            "WORKER_UNAVAILABLE",
-            "write worker unavailable, please retry after a few seconds",
-            5,
-        ));
-    }
-    let sync_ok = match rx.await {
-        Ok(ok) => ok,
-        Err(_) => {
-            return Ok(response_503_retry(
-                "WORKER_DROPPED",
-                "write worker dropped, please retry after a few seconds",
-                5,
-            ));
+    let sync_to_ts = end_of_yesterday_ts();
+
+    // Phase 0：预检缓存（block-scope conn 防止与后续写连接共存）
+    let (need_sync, need_compute, _cached_ok) = {
+        let conn = db::open_conn(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { code: "DB_ERROR".into(), message: e.to_string() })))?;
+        let mut ns: Vec<String> = Vec::new();
+        let mut nc: Vec<String> = Vec::new();
+        let mut co: Vec<String> = Vec::new();
+        for addr in &addresses {
+            match db::get_ts_range_conn(&conn, addr) {
+                Ok(Some((_min, max))) if max >= sync_to_ts => {
+                    if db::is_daily_cache_valid_conn(&conn, addr, max) {
+                        co.push(addr.clone());
+                    } else {
+                        nc.push(addr.clone());
+                    }
+                }
+                _ => {
+                    ns.push(addr.clone());
+                }
+            }
         }
-    };
-    if let Err(e) = sync_ok {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorBody {
-                code: "SYNC_ERROR".into(),
-                message: e,
-            }),
-        ));
+        tracing::info!(total = addresses.len(), cached = co.len(), need_compute = nc.len(), need_sync = ns.len(), "post daily-stats pre-check");
+        (ns, nc, co)
+    }; // conn drops here
+
+    // Phase 1：仅同步未同步的地址
+    if !need_sync.is_empty() {
+        let (tx, rx) = oneshot::channel();
+        if state
+            .write_job_tx
+            .send(WriteJob::SyncManyUntilYesterday {
+                items: need_sync.clone(),
+                respond: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Ok(response_503_retry("WORKER_UNAVAILABLE", "write worker unavailable, please retry after a few seconds", 5));
+        }
+        let sync_ok = match rx.await {
+            Ok(ok) => ok,
+            Err(_) => {
+                return Ok(response_503_retry("WORKER_DROPPED", "write worker dropped, please retry after a few seconds", 5));
+            }
+        };
+        if let Err(e) = sync_ok {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(ErrorBody { code: "SYNC_ERROR".into(), message: e })));
+        }
     }
 
+    // Phase 2：计算+缓存
+    let compute_addrs: Vec<String> = need_sync.iter().chain(need_compute.iter()).cloned().collect();
+    let mut computed: HashMap<String, Vec<(String, f64, f64)>> = HashMap::new();
+    if !compute_addrs.is_empty() {
+        let _guard = db::open_write_lock(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { code: "DB_ERROR".into(), message: e.to_string() })))?;
+        let wconn = db::open_conn(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { code: "DB_ERROR".into(), message: e.to_string() })))?;
+        for addr in &compute_addrs {
+            let daily = compute_and_cache_daily_stats(&wconn, addr, &from_date, &to_date);
+            computed.insert(addr.clone(), daily);
+        }
+    } // wconn + _guard drop here
+
+    // Phase 3：构建响应（fresh conn for reads）
+    let conn = db::open_conn(path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { code: "DB_ERROR".into(), message: e.to_string() })))?;
     let mut data = Vec::with_capacity(addresses.len());
-    for addr in addresses {
-        let activities = db::list_activities_in_range(path, &addr, from_ts, to_ts, 5_000_000).unwrap_or_default();
-        let daily = valuation::compute_daily_volume_and_realized_pnl(&activities, &from_date, &to_date);
+    for addr in &addresses {
+        let daily = if let Some(d) = computed.remove(addr) {
+            d
+        } else {
+            let cached = db::read_daily_stats_cache_conn(&conn, addr, &from_date, &to_date).unwrap_or_default();
+            fill_daily_stats_from_cache(&cached, &from_date, &to_date)
+        };
         let daily_points: Vec<DailyStatsPoint> = daily
             .into_iter()
-            .map(|(date, volume, profit)| DailyStatsPoint {
-                date,
-                volume,
-                profit,
-            })
+            .map(|(date, volume, profit)| DailyStatsPoint { date, volume, profit })
             .collect();
         data.push(WalletDailyStats {
-            wallet: addr,
+            wallet: addr.clone(),
             daily: daily_points,
         });
     }
@@ -1209,6 +1605,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/wallets/:address/activity",
             axum::routing::get(get_wallet_activity),
         )
+        .route("/wallets/activity", axum::routing::post(post_wallets_activity))
         .route(
             "/wallets/:address/open-positions",
             axum::routing::get(get_open_positions),

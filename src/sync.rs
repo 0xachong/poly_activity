@@ -39,20 +39,20 @@ fn is_deposit_or_withdraw(type_str: Option<&str>) -> bool {
     )
 }
 
-/// 拉取 [seg_start, seg_end] 从 Polymarket 并写入 DB，返回本段新增条数
+/// 纯 fetch：拉取 [seg_start, seg_end] 从 Polymarket，返回全部行（不写库）
 async fn fetch_segment(
     config: &Config,
-    db_path: &str,
     rate_limiter: &RateLimiter,
     client: &Client,
     addr: &str,
     seg_start: i64,
     seg_end: i64,
-) -> Result<u64, String> {
+) -> Result<Vec<ActivityRow>, String> {
     if seg_start > seg_end {
-        return Ok(0);
+        return Ok(vec![]);
     }
-    let mut total_inserted: u64 = 0;
+    tracing::info!(addr = %addr, seg_start = seg_start, seg_end = seg_end, "fetch_segment: start");
+    let mut all_rows: Vec<ActivityRow> = Vec::new();
     let mut batch_start = seg_start;
     let timeout = Duration::from_secs(config.request_timeout_secs);
     let limit = config.fetch_batch_limit as u32;
@@ -69,7 +69,7 @@ async fn fetch_segment(
             seg_end,
             limit
         );
-        tracing::info!(url = %url, "poly request");
+        tracing::info!(url = %url, "poly request: GET");
 
         let resp = client
             .get(&url)
@@ -147,10 +147,8 @@ async fn fetch_segment(
             .collect();
 
         let n = rows.len() as u64;
-        db::insert_activities_batch_unlocked(db_path, &rows).map_err(|e| e.to_string())?;
-        total_inserted += n;
-
         let max_ts = rows.iter().map(|r| r.ts).max().unwrap_or(batch_start);
+        all_rows.extend(rows);
 
         if n < limit as u64 {
             break;
@@ -162,12 +160,11 @@ async fn fetch_segment(
         }
     }
 
-    Ok(total_inserted)
+    Ok(all_rows)
 }
 
-/// 按请求区间 [from_ts, to_ts] 同步：取库中已有区间补缺口拉取并写入。
-/// 整段持有一把跨进程写锁，避免每批 insert 都加锁，减少锁竞争与 syscall。
-pub async fn sync_range(
+/// sync_range 内部实现：避免让 DuckDB Connection 跨 await（Connection 非 Send/Sync），否则 write worker 无法 tokio::spawn。
+async fn sync_range_impl(
     config: &Config,
     db_path: &str,
     rate_limiter: &RateLimiter,
@@ -181,37 +178,233 @@ pub async fn sync_range(
         return Ok(0);
     }
 
-    let _guard = db::open_write_lock(db_path).map_err(|e| e.to_string())?;
+    // Phase 0: 仅用于读取已有区间（短连接，不跨 await）
+    let range = {
+        let conn = db::open_conn(db_path).map_err(|e| e.to_string())?;
+        db::get_ts_range_conn(&conn, &addr).map_err(|e| e.to_string())?
+    }; // conn drop here
 
-    let range = db::get_ts_range(db_path, &addr).map_err(|e| e.to_string())?;
-    let mut total = 0u64;
+    // Phase 1: fetch all segments into memory（纯网络 IO，不用 DuckDB conn）
+    let rows = fetch_segments_for_range_with_known_range(config, rate_limiter, client, &addr, from_ts, to_ts, range).await?;
+    let total = rows.len() as u64;
+
+    // Phase 2+3: 写库 + 重算（短连接，不跨 await）
+    {
+        let conn = db::open_conn(db_path).map_err(|e| e.to_string())?;
+        db::insert_activities_batch_conn(&conn, &rows).map_err(|e| e.to_string())?;
+        if let Err(e) = recompute_effective_share_and_open_positions_conn(&conn, &addr) {
+            tracing::warn!(address = %addr, err = %e, "recompute effective_share and open_positions failed");
+        }
+    }
+
+    Ok(total)
+}
+
+/// 根据已知的库中 ts 区间，确定需要 fetch 的 gap segments，拉取并返回全部行（不写库）。
+async fn fetch_segments_for_range_with_known_range(
+    config: &Config,
+    rate_limiter: &RateLimiter,
+    client: &Client,
+    addr: &str,
+    from_ts: i64,
+    to_ts: i64,
+    range: Option<(i64, i64)>,
+) -> Result<Vec<ActivityRow>, String> {
+    let mut all_rows = Vec::new();
 
     match range {
         None => {
-            total += fetch_segment(config, db_path, rate_limiter, client, &addr, from_ts, to_ts).await?;
+            all_rows.extend(fetch_segment(config, rate_limiter, client, addr, from_ts, to_ts).await?);
         }
         Some((from1, to1)) => {
             if to_ts < from1 {
-                total += fetch_segment(config, db_path, rate_limiter, client, &addr, from_ts, to1).await?;
+                all_rows.extend(fetch_segment(config, rate_limiter, client, addr, from_ts, to1).await?);
             } else if from_ts > to1 {
-                total += fetch_segment(config, db_path, rate_limiter, client, &addr, to1, to_ts).await?;
+                all_rows.extend(fetch_segment(config, rate_limiter, client, addr, to1, to_ts).await?);
             } else {
                 if from_ts < from1 {
-                    total += fetch_segment(config, db_path, rate_limiter, client, &addr, from_ts, from1).await?;
+                    all_rows.extend(fetch_segment(config, rate_limiter, client, addr, from_ts, from1).await?);
                 }
                 if to_ts > to1 {
-                    total += fetch_segment(config, db_path, rate_limiter, client, &addr, to1, to_ts).await?;
+                    all_rows.extend(fetch_segment(config, rate_limiter, client, addr, to1, to_ts).await?);
                 }
             }
         }
     }
 
-    // 同步后按时间序重算：REDEEM 的 effective_share 写入 activities，当前未平仓写入 open_positions（本段已持锁，用 _unlocked）
-    if let Err(e) = recompute_effective_share_and_open_positions(db_path, &addr, true) {
-        tracing::warn!(address = %addr, err = %e, "recompute effective_share and open_positions failed");
+    Ok(all_rows)
+}
+
+/// 根据库中已有区间，确定需要 fetch 的 gap segments，拉取并返回全部行（不写库）。用 conn 取区间时避免另开连接。
+async fn fetch_segments_for_range_with_conn(
+    conn: &duckdb::Connection,
+    config: &Config,
+    _db_path: &str,
+    rate_limiter: &RateLimiter,
+    client: &Client,
+    addr: &str,
+    from_ts: i64,
+    to_ts: i64,
+) -> Result<Vec<ActivityRow>, String> {
+    let range = db::get_ts_range_conn(conn, addr).map_err(|e| e.to_string())?;
+    fetch_segments_for_range_with_known_range(config, rate_limiter, client, addr, from_ts, to_ts, range).await
+}
+
+/// 根据库中已有区间，确定需要 fetch 的 gap segments，拉取并返回全部行（不写库）。无 conn 时自开连接取区间（用于 sync_range_fetch_only）。
+async fn fetch_segments_for_range(
+    config: &Config,
+    db_path: &str,
+    rate_limiter: &RateLimiter,
+    client: &Client,
+    addr: &str,
+    from_ts: i64,
+    to_ts: i64,
+) -> Result<Vec<ActivityRow>, String> {
+    let range = db::get_ts_range(db_path, addr).map_err(|e| e.to_string())?;
+    let mut all_rows = Vec::new();
+
+    match range {
+        None => {
+            all_rows.extend(fetch_segment(config, rate_limiter, client, addr, from_ts, to_ts).await?);
+        }
+        Some((from1, to1)) => {
+            if to_ts < from1 {
+                all_rows.extend(fetch_segment(config, rate_limiter, client, addr, from_ts, to1).await?);
+            } else if from_ts > to1 {
+                all_rows.extend(fetch_segment(config, rate_limiter, client, addr, to1, to_ts).await?);
+            } else {
+                if from_ts < from1 {
+                    all_rows.extend(fetch_segment(config, rate_limiter, client, addr, from_ts, from1).await?);
+                }
+                if to_ts > to1 {
+                    all_rows.extend(fetch_segment(config, rate_limiter, client, addr, to1, to_ts).await?);
+                }
+            }
+        }
     }
 
+    Ok(all_rows)
+}
+
+/// 按请求区间 [from_ts, to_ts] 同步：取库中已有区间补缺口拉取并写入。
+/// 整段持有一把跨进程写锁且仅打开一次 DuckDB 连接，避免多次 open/close 触发元数据错误。
+pub async fn sync_range(
+    config: &Config,
+    db_path: &str,
+    rate_limiter: &RateLimiter,
+    client: &Client,
+    address: &str,
+    from_ts: i64,
+    to_ts: i64,
+) -> Result<u64, String> {
+    let _guard = db::open_write_lock(db_path).map_err(|e| e.to_string())?;
+    tracing::info!(address = %address, from_ts = from_ts, to_ts = to_ts, "sync_range: acquired db lock, fetching from Polymarket");
+    sync_range_impl(config, db_path, rate_limiter, client, address, from_ts, to_ts).await
+}
+
+/// 按请求区间同步（不加锁）。仅当调用方已持有 open_write_lock 时使用；调用方需自备连接并传入，以复用单连接。
+pub(crate) async fn sync_range_unlocked(
+    conn: &duckdb::Connection,
+    config: &Config,
+    _db_path: &str,
+    rate_limiter: &RateLimiter,
+    client: &Client,
+    address: &str,
+    from_ts: i64,
+    to_ts: i64,
+) -> Result<u64, String> {
+    // 仅供少量内部调用；注意：不要在 tokio::spawn 的 future 里跨 await 持有 &Connection。
+    // 这里保持原接口，但只在当前 async context 内安全使用。
+    let addr = address.to_lowercase();
+    if from_ts > to_ts {
+        return Ok(0);
+    }
+    let range = db::get_ts_range_conn(conn, &addr).map_err(|e| e.to_string())?;
+    let rows =
+        fetch_segments_for_range_with_known_range(config, rate_limiter, client, &addr, from_ts, to_ts, range).await?;
+    let total = rows.len() as u64;
+    db::insert_activities_batch_conn(conn, &rows).map_err(|e| e.to_string())?;
+    if let Err(e) = recompute_effective_share_and_open_positions_conn(conn, &addr) {
+        tracing::warn!(address = %addr, err = %e, "recompute effective_share and open_positions failed");
+    }
     Ok(total)
+}
+
+/// 仅 fetch（不写库）：gap 检测 + 并发拉取，返回 Vec<ActivityRow>。
+/// 用于批量任务的并行 fetch 阶段，调用方稍后统一加锁写库。
+pub(crate) async fn sync_range_fetch_only(
+    config: &Config,
+    db_path: &str,
+    rate_limiter: &RateLimiter,
+    client: &Client,
+    address: &str,
+    from_ts: i64,
+    to_ts: i64,
+) -> Result<Vec<ActivityRow>, String> {
+    let addr = address.to_lowercase();
+    if from_ts > to_ts {
+        return Ok(vec![]);
+    }
+    fetch_segments_for_range(config, db_path, rate_limiter, client, &addr, from_ts, to_ts).await
+}
+
+/// 写入 + 重算 effective_share + open_positions（不加锁）。
+/// 调用方需已持有 open_write_lock。用于批量任务的串行写库阶段。
+/// 当 rows 为空时（已同步地址无新数据），跳过全部 DB 操作。
+pub(crate) fn write_and_recompute_unlocked(
+    db_path: &str,
+    address: &str,
+    rows: &[ActivityRow],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    db::insert_activities_batch_unlocked(db_path, rows).map_err(|e| e.to_string())?;
+    if let Err(e) = recompute_effective_share_and_open_positions(db_path, address, true) {
+        tracing::warn!(address = %address, err = %e, "recompute effective_share and open_positions failed");
+    }
+    Ok(())
+}
+
+/// 按该地址全量活动重算 REDEEM 的 effective_share 与当前未平仓，并落库（使用已有连接）。
+fn recompute_effective_share_and_open_positions_conn(
+    conn: &duckdb::Connection,
+    address: &str,
+) -> Result<(), String> {
+    let (min_ts, max_ts) = match db::get_ts_range_conn(conn, address).map_err(|e| e.to_string())? {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let activities =
+        db::list_activities_in_range_conn(conn, address, min_ts, max_ts, 5_000_000).map_err(|e| e.to_string())?;
+    let (effective, open_positions) = valuation::effective_redeem_shares_and_open_positions(&activities);
+
+    let updates: Vec<(String, String, String, f64)> = activities
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            if row.type_.eq_ignore_ascii_case("REDEEM") {
+                effective.get(i).copied().flatten().map(|eff| {
+                    (
+                        row.transaction_hash.as_deref().unwrap_or("").to_string(),
+                        row.condition_id.as_deref().unwrap_or("").to_string(),
+                        row.token_id.as_deref().unwrap_or("").to_string(),
+                        eff,
+                    )
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let updates_ref: Vec<(&str, &str, &str, f64)> = updates
+        .iter()
+        .map(|(a, b, c, d)| (a.as_str(), b.as_str(), c.as_str(), *d))
+        .collect();
+    db::update_effective_share_for_redeems_conn(conn, address, &updates_ref).map_err(|e| e.to_string())?;
+    db::replace_open_positions_conn(conn, address, &open_positions).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// 按该地址全量活动重算 REDEEM 的 effective_share 与当前未平仓，并落库。

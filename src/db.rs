@@ -1,6 +1,6 @@
 //! DuckDB 存储：activities 表、open_positions 表及读写
 
-use duckdb::{params, Connection, Result};
+use duckdb::{params, AccessMode, Config, Connection, Result};
 use fs4::FileExt;
 use std::path::Path;
 
@@ -52,12 +52,165 @@ pub struct OpenPositionRow {
     pub share: f64,
 }
 
+fn should_open_read_only() -> bool {
+    std::env::var("POLY_ACTIVITY_DB_READ_ONLY")
+        .ok()
+        .map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 fn open(path: &str) -> Result<Connection> {
     let parent = Path::new(path).parent();
     if let Some(p) = parent {
         let _ = std::fs::create_dir_all(p);
     }
-    Connection::open(path)
+    if should_open_read_only() {
+        let cfg = Config::default().access_mode(AccessMode::ReadOnly)?;
+        Connection::open_with_flags(path, cfg)
+    } else {
+        Connection::open(path)
+    }
+}
+
+/// 打开连接供批量操作复用（避免每次查询都 open 一次），适合同一线程内多次读写。
+pub(crate) fn open_conn(path: &str) -> Result<Connection> {
+    open(path)
+}
+
+/// 该地址在库中的 ts 区间（使用已有连接）
+pub(crate) fn get_ts_range_conn(conn: &Connection, address: &str) -> Result<Option<(i64, i64)>> {
+    let addr = address.to_lowercase();
+    let min_ts: Option<i64> = conn.query_row(
+        "SELECT min(ts) FROM activities WHERE address = ?",
+        [&addr],
+        |r| r.get::<_, Option<i64>>(0),
+    )?;
+    let max_ts: Option<i64> = conn.query_row(
+        "SELECT max(ts) FROM activities WHERE address = ?",
+        [&addr],
+        |r| r.get::<_, Option<i64>>(0),
+    )?;
+    Ok(match (min_ts, max_ts) {
+        (Some(mi), Some(ma)) => Some((mi, ma)),
+        _ => None,
+    })
+}
+
+/// 按时间区间查活动（使用已有连接），按 ts 升序
+pub(crate) fn list_activities_in_range_conn(
+    conn: &Connection,
+    address: &str,
+    from_ts: i64,
+    to_ts: i64,
+    limit: u32,
+) -> Result<Vec<ActivityRow>> {
+    let addr = address.to_lowercase();
+    let limit_i = limit.min(5_000_000) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT address, ts, type, share, price, usdc_size, title, outcome, condition_id, token_id, transaction_hash, ts_utc, effective_share
+         FROM activities WHERE address = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC LIMIT ?",
+    )?;
+    let rows = stmt
+        .query_map(params![addr, from_ts, to_ts, limit_i], map_row)?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// 按时间区间查询（使用已有连接），按 ts 倒序 + 总数
+pub(crate) fn list_activities_conn(
+    conn: &Connection,
+    address: &str,
+    from_ts: i64,
+    to_ts: i64,
+    limit: u32,
+    type_filter: Option<&str>,
+) -> Result<(Vec<ActivityRow>, u64)> {
+    let addr = address.to_lowercase();
+    let limit_i = limit.min(50_000) as i64;
+
+    let total: i64 = if let Some(t) = type_filter {
+        conn.query_row(
+            "SELECT COUNT(*) FROM activities WHERE address = ? AND ts >= ? AND ts <= ? AND type = ?",
+            params![addr, from_ts, to_ts, t],
+            |r| r.get(0),
+        )?
+    } else {
+        conn.query_row(
+            "SELECT COUNT(*) FROM activities WHERE address = ? AND ts >= ? AND ts <= ?",
+            params![addr, from_ts, to_ts],
+            |r| r.get(0),
+        )?
+    };
+
+    let rows: Vec<ActivityRow> = if let Some(t) = type_filter {
+        let mut stmt = conn.prepare(
+            "SELECT address, ts, type, share, price, usdc_size, title, outcome, condition_id, token_id, transaction_hash, ts_utc, effective_share FROM activities WHERE address = ? AND ts >= ? AND ts <= ? AND type = ? ORDER BY ts DESC LIMIT ?",
+        )?;
+        stmt.query_map(params![addr, from_ts, to_ts, t, limit_i], map_row)?.collect::<Result<Vec<_>>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT address, ts, type, share, price, usdc_size, title, outcome, condition_id, token_id, transaction_hash, ts_utc, effective_share FROM activities WHERE address = ? AND ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT ?",
+        )?;
+        stmt.query_map(params![addr, from_ts, to_ts, limit_i], map_row)?.collect::<Result<Vec<_>>>()?
+    };
+
+    Ok((rows, total as u64))
+}
+
+/// 检查该地址的 daily_stats 缓存是否有效（使用已有连接）
+pub(crate) fn is_daily_cache_valid_conn(conn: &Connection, address: &str, current_max_ts: i64) -> bool {
+    let addr = address.to_lowercase();
+    conn.query_row(
+        "SELECT activities_max_ts FROM daily_stats_cache_version WHERE address = ?",
+        [&addr],
+        |r| r.get::<_, i64>(0),
+    )
+    .ok()
+    .map(|cached_ts| cached_ts == current_max_ts)
+    .unwrap_or(false)
+}
+
+/// 读取缓存的每日统计（使用已有连接），只返回有数据的日期
+pub(crate) fn read_daily_stats_cache_conn(
+    conn: &Connection,
+    address: &str,
+    from_date: &str,
+    to_date: &str,
+) -> Result<Vec<(String, f64, f64)>> {
+    let addr = address.to_lowercase();
+    let mut stmt = conn.prepare(
+        "SELECT date, volume, profit FROM daily_stats_cache WHERE address = ? AND date >= ? AND date <= ? ORDER BY date",
+    )?;
+    let rows = stmt
+        .query_map(params![addr, from_date, to_date], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// 写入 daily_stats 缓存（使用已有连接）。先删旧缓存，再写新数据 + 更新版本号。
+/// data 中只传非零条目即可。调用方需确保写安全（持有 write lock 或无并发写）。
+pub(crate) fn write_daily_stats_cache_conn(
+    conn: &Connection,
+    address: &str,
+    activities_max_ts: i64,
+    data: &[(String, f64, f64)],
+) -> Result<()> {
+    let addr = address.to_lowercase();
+    conn.execute("DELETE FROM daily_stats_cache WHERE address = ?", [&addr])?;
+    for (date, volume, profit) in data {
+        conn.execute(
+            "INSERT INTO daily_stats_cache (address, date, volume, profit) VALUES (?, ?, ?, ?)",
+            params![&addr, date, volume, profit],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO daily_stats_cache_version (address, activities_max_ts) VALUES (?, ?)
+         ON CONFLICT (address) DO UPDATE SET activities_max_ts = excluded.activities_max_ts",
+        params![&addr, activities_max_ts],
+    )?;
+    Ok(())
 }
 
 /// 初始化 schema：activities 表、open_positions 表
@@ -90,7 +243,18 @@ pub fn init_schema(path: &str) -> Result<()> {
             share DOUBLE,
             PRIMARY KEY (address, token_id)
         );
-        CREATE INDEX IF NOT EXISTS idx_open_positions_address ON open_positions(address);",
+        CREATE INDEX IF NOT EXISTS idx_open_positions_address ON open_positions(address);
+        CREATE TABLE IF NOT EXISTS daily_stats_cache (
+            address VARCHAR,
+            date VARCHAR,
+            volume DOUBLE DEFAULT 0,
+            profit DOUBLE DEFAULT 0,
+            PRIMARY KEY (address, date)
+        );
+        CREATE TABLE IF NOT EXISTS daily_stats_cache_version (
+            address VARCHAR PRIMARY KEY,
+            activities_max_ts BIGINT
+        );",
     )?;
     Ok(())
 }
@@ -115,14 +279,24 @@ pub fn get_ts_range(path: &str, address: &str) -> Result<Option<(i64, i64)>> {
     })
 }
 
-/// 删除该地址下全部 activities 及 open_positions（用于 force_refresh 时清空后重拉）
-pub fn delete_activities_for_address(path: &str, address: &str) -> Result<u64> {
-    let _guard = open_write_lock(path).map_err(io_to_duckdb)?;
+/// 删除该地址下全部 activities 及 open_positions（内部实现，不加锁）
+fn delete_activities_for_address_impl(path: &str, address: &str) -> Result<u64> {
     let conn = open(path)?;
     let addr = address.to_lowercase();
     let _ = conn.execute("DELETE FROM open_positions WHERE address = ?", [&addr])?;
     let n = conn.execute("DELETE FROM activities WHERE address = ?", [&addr])?;
     Ok(n as u64)
+}
+
+/// 删除该地址下全部 activities 及 open_positions（用于 force_refresh 时清空后重拉）
+pub fn delete_activities_for_address(path: &str, address: &str) -> Result<u64> {
+    let _guard = open_write_lock(path).map_err(io_to_duckdb)?;
+    delete_activities_for_address_impl(path, address)
+}
+
+/// 删除该地址下全部 activities 及 open_positions（不加锁）。仅当调用方已持有 open_write_lock 时使用。
+pub(crate) fn delete_activities_for_address_unlocked(path: &str, address: &str) -> Result<u64> {
+    delete_activities_for_address_impl(path, address)
 }
 
 fn ts_to_utc_str(ts: i64) -> String {
@@ -131,12 +305,11 @@ fn ts_to_utc_str(ts: i64) -> String {
         .unwrap_or_default()
 }
 
-/// 批量写入 Activity（内部实现，不加锁）。调用方需已持有 open_write_lock 或仅单写场景使用。
-fn insert_activities_batch_impl(path: &str, rows: &[ActivityRow]) -> Result<()> {
+/// 批量写入 Activity（使用已有连接）。调用方需已持有 open_write_lock；整段 sync 复用同一连接可避免多次 open/close 触发的 DuckDB 元数据错误。
+pub(crate) fn insert_activities_batch_conn(conn: &Connection, rows: &[ActivityRow]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-    let conn = open(path)?;
     for r in rows {
         let addr = r.address.to_lowercase();
         let cond_id = r.condition_id.as_deref().unwrap_or("");
@@ -171,6 +344,15 @@ fn insert_activities_batch_impl(path: &str, rows: &[ActivityRow]) -> Result<()> 
         )?;
     }
     Ok(())
+}
+
+/// 批量写入 Activity（内部实现，不加锁）。调用方需已持有 open_write_lock 或仅单写场景使用。
+fn insert_activities_batch_impl(path: &str, rows: &[ActivityRow]) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let conn = open(path)?;
+    insert_activities_batch_conn(&conn, rows)
 }
 
 /// 批量写入 Activity，唯一冲突则更新
@@ -265,6 +447,25 @@ pub fn list_activities_in_range(
     Ok(rows)
 }
 
+/// 更新一批 REDEEM 行的 effective_share（使用已有连接）。仅当调用方已持有 open_write_lock 时使用。
+pub(crate) fn update_effective_share_for_redeems_conn(
+    conn: &Connection,
+    address: &str,
+    updates: &[(&str, &str, &str, f64)],
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let addr = address.to_lowercase();
+    for (tx, cond, tok, eff) in updates.iter() {
+        conn.execute(
+            "UPDATE activities SET effective_share = ? WHERE address = ? AND COALESCE(transaction_hash,'') = ? AND COALESCE(condition_id,'') = ? AND COALESCE(token_id,'') = ?",
+            params![eff, &addr, tx, cond, tok],
+        )?;
+    }
+    Ok(())
+}
+
 /// 更新一批 REDEEM 行的 effective_share（内部实现，不加锁）。
 fn update_effective_share_for_redeems_impl(
     path: &str,
@@ -275,14 +476,7 @@ fn update_effective_share_for_redeems_impl(
         return Ok(());
     }
     let conn = open(path)?;
-    let addr = address.to_lowercase();
-    for (tx, cond, tok, eff) in updates.iter() {
-        conn.execute(
-            "UPDATE activities SET effective_share = ? WHERE address = ? AND COALESCE(transaction_hash,'') = ? AND COALESCE(condition_id,'') = ? AND COALESCE(token_id,'') = ?",
-            params![eff, &addr, tx, cond, tok],
-        )?;
-    }
-    Ok(())
+    update_effective_share_for_redeems_conn(&conn, address, updates)
 }
 
 /// 更新一批 REDEEM 行的 effective_share（由同步后重算写入）。key 为 (transaction_hash, condition_id, token_id)，空用 ""。
@@ -324,13 +518,12 @@ pub fn list_open_positions(path: &str, address: &str) -> Result<Vec<OpenPosition
     Ok(rows)
 }
 
-/// 替换该地址的未平仓列表（内部实现，不加锁）。
-fn replace_open_positions_impl(
-    path: &str,
+/// 替换该地址的未平仓列表（使用已有连接）。仅当调用方已持有 open_write_lock 时使用。
+pub(crate) fn replace_open_positions_conn(
+    conn: &Connection,
     address: &str,
     positions: &[(String, String, f64)],
 ) -> Result<()> {
-    let conn = open(path)?;
     let addr = address.to_lowercase();
     conn.execute("DELETE FROM open_positions WHERE address = ?", [&addr])?;
     for (token_id, condition_id, share) in positions.iter() {
@@ -343,6 +536,16 @@ fn replace_open_positions_impl(
         )?;
     }
     Ok(())
+}
+
+/// 替换该地址的未平仓列表（内部实现，不加锁）。
+fn replace_open_positions_impl(
+    path: &str,
+    address: &str,
+    positions: &[(String, String, f64)],
+) -> Result<()> {
+    let conn = open(path)?;
+    replace_open_positions_conn(&conn, address, positions)
 }
 
 /// 替换该地址的未平仓列表（同步后重算：先删后插）

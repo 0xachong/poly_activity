@@ -13,6 +13,10 @@ pub struct Config {
     pub fetch_batch_limit: u32,
     /// 批量接口（activity 批量、daily-stats 多钱包）最多允许的地址数量，防止单次请求拖垮服务或打满 Polymarket 限流
     pub max_batch_addresses: usize,
+    /// 批量任务并发 fetch 的最大并发数（Semaphore 令牌数），防止同时发起过多连接
+    pub fetch_concurrency: usize,
+    /// 为 true 时仅「抢到 leader 锁」的实例执行写库，其它实例对写请求返回 503，实现单写实例
+    pub single_writer: bool,
 }
 
 impl Config {
@@ -46,6 +50,14 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50),
+            fetch_concurrency: env::var("FETCH_CONCURRENCY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+            single_writer: env::var("SINGLE_WRITER")
+                .ok()
+                .map(|s| !matches!(s.to_lowercase().as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
         }
     }
 }
